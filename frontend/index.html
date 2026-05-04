@@ -1,61 +1,173 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="fr">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI QA Agent</title>
-    <link rel="stylesheet" href="/static/styles.css">
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap" rel="stylesheet">
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OMNISHORE QA Agent</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
 </head>
 <body>
-    <div class="background-shapes">
-        <div class="shape circle1"></div>
-        <div class="shape circle2"></div>
-        <div class="shape circle3"></div>
+
+  <!-- NAVBAR -->
+  <nav class="navbar">
+    <div class="navbar-brand">
+      <span class="brand-name">OMNISHORE</span>
+      <span class="brand-sub">QA Agent</span>
     </div>
+    <span class="navbar-status" id="agent-status">&#9679; IDLE</span>
+  </nav>
 
-    <div class="app-container">
-        <header>
-            <div class="logo">
-                <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <circle cx="12" cy="12" r="10"></circle>
-                    <polygon points="10 8 16 12 10 16 10 8"></polygon>
-                </svg>
-                <h1>QA <span>Agent</span></h1>
+  <div class="main-container">
+
+    <!-- LEFT PANEL -->
+    <aside>
+
+      <!-- Input Source Card -->
+      <div class="card" style="margin-bottom:1rem">
+        <div class="card-header">&#9889; Source de Test</div>
+        <div class="card-body">
+          <div class="tab-bar">
+            <div class="tab active" data-tab="url">URL</div>
+            <div class="tab" data-tab="spec">Fichier Spec</div>
+          </div>
+
+          <!-- URL tab -->
+          <div id="tab-url">
+            <div class="form-group">
+              <label class="form-label">URL cible</label>
+              <input type="url" id="target-url" class="form-input"
+                     placeholder="https://exemple.com/login">
             </div>
-            <p class="subtitle">AI-powered autonomous functional testing for Web Apps.</p>
-        </header>
+          </div>
 
-        <main>
-            <div class="glass-panel input-section">
-                <h2>Target URL</h2>
-                <div class="input-group">
-                    <input type="url" id="url-input" placeholder="https://practicetestautomation.com/practice-test-login/" value="https://practicetestautomation.com/practice-test-login/">
-                    <button id="run-btn" class="run-btn">
-                        <span class="btn-text">Run tests</span>
-                        <div class="spinner hidden"></div>
-                    </button>
-                </div>
-                <div class="agent-status" id="agent-status">Ready to initialize.</div>
+          <!-- Spec tab -->
+          <div id="tab-spec" style="display:none">
+            <div class="drop-zone" id="drop-zone">
+              <div class="drop-zone-icon">&#128196;</div>
+              <div>Glisser-d&eacute;poser un fichier .md, .txt ou .pdf</div>
+              <div style="font-size:0.75rem;margin-top:0.3rem">ou cliquer pour parcourir</div>
+              <input type="file" id="spec-file" accept=".md,.txt,.pdf,.sfd" style="display:none">
             </div>
-
-            <div class="glass-panel results-section hidden" id="results-panel">
-                <div class="results-header">
-                    <h2>Test Report</h2>
-                    <div class="metrics">
-                        <div class="metric total"><span id="metric-total">0</span> Total</div>
-                        <div class="metric passed"><span id="metric-passed">0</span> Passed</div>
-                        <div class="metric failed"><span id="metric-failed">0</span> Failed</div>
-                    </div>
-                </div>
-
-                <div class="test-list" id="test-list">
-                    <!-- Dynamic test cases -->
-                </div>
+            <div id="spec-filename" style="font-size:0.8rem;color:var(--accent);margin-top:0.5rem;min-height:1.2em"></div>
+            <div class="form-group" style="margin-top:0.75rem">
+              <label class="form-label">URL cible (optionnelle)</label>
+              <input type="url" id="spec-url" class="form-input" placeholder="https://...">
             </div>
-        </main>
-    </div>
+          </div>
+        </div>
+      </div>
 
-    <script src="/static/app.js"></script>
+      <!-- Browser Selection Card -->
+      <div class="card" style="margin-bottom:1rem">
+        <div class="card-header">&#127760; Navigateurs</div>
+        <div class="card-body">
+          <div class="browser-grid">
+            <label class="browser-option selected" data-browser="chromium">
+              <span class="browser-check"></span>&#128992; Chromium
+            </label>
+            <label class="browser-option" data-browser="firefox">
+              <span class="browser-check"></span>&#129418; Firefox
+            </label>
+            <label class="browser-option" data-browser="webkit">
+              <span class="browser-check"></span>&#129519; WebKit
+            </label>
+            <label class="browser-option" data-browser="chrome">
+              <span class="browser-check"></span>&#128309; Chrome
+            </label>
+            <label class="browser-option" data-browser="edge">
+              <span class="browser-check"></span>&#128311; Edge
+            </label>
+          </div>
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-top:0.6rem">
+            <span style="font-size:0.75rem;color:var(--neutral)">
+              Ex&eacute;cution parall&egrave;le &mdash; <span id="browser-count">1</span> s&eacute;lectionn&eacute;(s)
+            </span>
+            <span style="font-size:0.72rem">
+              <a href="#" onclick="selectAllBrowsers();return false" style="color:var(--accent);text-decoration:none;margin-right:0.6rem">Tout</a>
+              <a href="#" onclick="clearBrowsers();return false" style="color:var(--neutral);text-decoration:none">Aucun</a>
+            </span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Run Button -->
+      <button class="btn-primary" id="run-btn" onclick="startAgent()">
+        &#9654; LANCER LES TESTS
+      </button>
+
+      <!-- Progress -->
+      <div id="progress-container" style="display:none;margin-top:1rem">
+        <div style="display:flex;justify-content:space-between;font-size:0.78rem;color:var(--secondary);margin-bottom:0.3rem">
+          <span id="progress-label">Initialisation...</span>
+          <span id="progress-pct">0%</span>
+        </div>
+        <div class="progress-bar-container">
+          <div class="progress-bar-fill" id="progress-bar" style="width:0%"></div>
+        </div>
+      </div>
+
+      <!-- Past Runs -->
+      <div class="card" style="margin-top:1rem">
+        <div class="card-header">&#128196; Historique</div>
+        <div class="card-body" style="padding:0.75rem">
+          <div id="runs-list" style="font-size:0.82rem;color:var(--neutral)">Chargement...</div>
+        </div>
+      </div>
+
+    </aside>
+
+    <!-- RIGHT PANEL -->
+    <main>
+
+      <!-- Live Terminal -->
+      <div class="card" style="margin-bottom:1rem">
+        <div class="card-header">
+          <span class="live-dot" id="live-dot" style="display:none"></span>
+          &#128223; Logs en Temps R&eacute;el
+        </div>
+        <div class="terminal" id="terminal">
+          <span style="color:#4A5568">// En attente d&apos;ex&eacute;cution &mdash; OMNISHORE QA Agent pr&ecirc;t</span>
+        </div>
+      </div>
+
+      <!-- Metrics Row -->
+      <div class="metrics-row" id="metrics-row" style="display:none">
+        <div class="metric-card">
+          <div class="metric-value" id="m-total">0</div>
+          <div class="metric-label">Total Tests</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-value" style="color:var(--success)" id="m-passed">0</div>
+          <div class="metric-label">R&eacute;ussis</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-value" style="color:var(--danger)" id="m-failed">0</div>
+          <div class="metric-label">&Eacute;chou&eacute;s</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-value" style="color:var(--warning)" id="m-partial">0</div>
+          <div class="metric-label">Partiels</div>
+        </div>
+      </div>
+
+      <!-- Results Card -->
+      <div class="card" id="results-card" style="display:none">
+        <div class="card-header" style="justify-content:space-between">
+          <span>&#128202; R&eacute;sultats &amp; Matrice Cross-Browser</span>
+          <button class="btn-download" id="download-btn" style="display:none"
+                  onclick="downloadReport()">
+            &#128196; T&eacute;l&eacute;charger Rapport Word
+          </button>
+        </div>
+        <div class="card-body" style="overflow-x:auto">
+          <div id="matrix-container"></div>
+        </div>
+      </div>
+
+    </main>
+  </div>
+
+  <script src="/static/app.js"></script>
 </body>
 </html>
