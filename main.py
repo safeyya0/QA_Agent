@@ -139,11 +139,19 @@ async def get_run(filename: str):
 
 # ── Agent run endpoints ───────────────────────────────────────────────────────
 
+def _normalize_url(url: str) -> str:
+    url = url.strip()
+    if url and not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    return url
+
+
 @app.post("/api/run-agent")
 async def run_agent(
     url: str = Form(...),
     browsers: str = Form(default="chromium"),
 ):
+    url = _normalize_url(url)
     if not url:
         raise HTTPException(status_code=400, detail="Missing url")
     browser_list = [b.strip() for b in browsers.split(",") if b.strip()] or ["chromium"]
@@ -180,7 +188,7 @@ async def run_agent_with_spec(
     agent = CoreAgent()
     try:
         return await agent.run_multi_browser_with_spec(
-            url.strip(), spec_text, browser_list, emit_fn=_broadcast_event
+            _normalize_url(url), spec_text, browser_list, emit_fn=_broadcast_event
         )
     finally:
         _broadcast_done()

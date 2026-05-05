@@ -65,6 +65,14 @@ STEP_FR = {
 
 # ── Low-level helpers ─────────────────────────────────────────────────────────
 
+import re as _re
+
+def _safe(text) -> str:
+    """Strip XML-incompatible characters (null bytes, control chars) from any value."""
+    s = str(text) if text is not None else "—"
+    return _re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', s)
+
+
 def _rgb(h: str) -> RGBColor:
     h = h.lstrip("#")
     return RGBColor(int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
@@ -468,8 +476,8 @@ def _environment(doc, url, browsers_str, date_fr):
         ("Navigateur(s)",          browsers_str),
         ("Mode d'exécution",       "Headless (sans interface graphique)"),
         ("Outil d'automatisation", "Playwright (Python asyncio)"),
-        ("Modèle IA — tests",      "Groq — Llama 3.1 8B Instant"),
-        ("Modèle IA — conclusion", "Groq — Llama 3 70B"),
+        ("Modèle IA — tests",      "Groq — Llama 3.3 70B Versatile"),
+        ("Modèle IA — conclusion", "Groq — Llama 3.3 70B Versatile"),
         ("Outil de test",          "OMNISHORE QA Agent v2.0"),
         ("Date d'exécution",       date_fr),
         ("Rapport généré le",      datetime.now().strftime("%d/%m/%Y à %H:%M:%S")),
@@ -764,8 +772,8 @@ def _test_card(doc, res: dict, index: int):
             row = st_tbl.rows[si].cells
             _cell_bg(row[0], C["light"]); _cell_bg(row[1], C["white"]); _cell_bg(row[2], C["white"])
             row[0].paragraphs[0].add_run(str(si)).font.size = Pt(8)
-            row[1].paragraphs[0].add_run(step.get("field", "—")).font.size = Pt(8)
-            row[2].paragraphs[0].add_run(str(step.get("value", "—"))[:80]).font.size = Pt(8)
+            row[1].paragraphs[0].add_run(_safe(step.get("field", "—"))).font.size = Pt(8)
+            row[2].paragraphs[0].add_run(_safe(step.get("value", "—"))[:80]).font.size = Pt(8)
         doc.add_paragraph()
 
     # Auth sub-steps
@@ -833,7 +841,7 @@ def _test_card(doc, res: dict, index: int):
             sr3.bold = True; sr3.font.size = Pt(8.5); sr3.font.name = "Calibri"
             sr3.font.color.rgb = _rgb(bfg)
             row[1].paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
-            err = (bl.get("error") or "—")[:120]
+            err = _safe(bl.get("error") or "—")[:120]
             er = row[2].paragraphs[0].add_run(err)
             er.font.size = Pt(7.5); er.italic = True; er.font.name = "Calibri"
             er.font.color.rgb = _rgb(C["danger"] if bst == "FAILED" else C["slate"])

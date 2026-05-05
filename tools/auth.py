@@ -24,16 +24,25 @@ def detect_auth_forms(fields: list, url: str, page_text: str = "") -> dict:
     has_password = "password" in field_types
     has_email = "email" in field_types or any("email" in i for i in all_identifiers)
     has_confirm_password = any("confirm" in i for i in all_identifiers)
-    has_username = any("username" in i or "user_name" in i for i in all_identifiers)
+    has_username = any(
+        "username" in i or "user_name" in i or "user-name" in i or
+        (i.startswith("user") and len(i) <= 12)
+        for i in all_identifiers
+    )
 
     register_url_signal = any(kw in url_lower for kw in ["register", "signup", "sign-up", "create-account", "join"])
     login_url_signal = any(kw in url_lower for kw in ["login", "signin", "sign-in", "auth"])
 
     register_text_signal = any(kw in text_lower for kw in ["create account", "sign up", "register", "join us", "get started", "create your account"])
-    login_text_signal = any(kw in text_lower for kw in ["sign in", "log in", "login", "welcome back"])
+    login_text_signal = any(kw in text_lower for kw in ["sign in", "log in", "login", "welcome back", "accepted usernames"])
 
     has_register = register_url_signal or has_confirm_password or (register_text_signal and not login_url_signal)
-    has_login = login_url_signal or (has_password and has_email and not has_register) or (login_text_signal and not has_register)
+    has_login = (
+        login_url_signal or
+        (has_password and (has_email or has_username) and not has_register) or
+        (login_text_signal and not has_register) or
+        (has_password and len(fields) <= 3 and not has_register)
+    )
 
     login_url = url if has_login else _derive_login_url(url)
     register_url = url if has_register else None

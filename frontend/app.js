@@ -79,12 +79,12 @@ dropZone.addEventListener('drop', e => {
   dropZone.classList.remove('dragover');
   if (e.dataTransfer.files[0]) {
     fileInput.files = e.dataTransfer.files;
-    document.getElementById('spec-filename').textContent = `✓ ${e.dataTransfer.files[0].name}`;
+    document.getElementById('spec-filename').textContent = e.dataTransfer.files[0].name;
   }
 });
 fileInput.addEventListener('change', () => {
   if (fileInput.files[0])
-    document.getElementById('spec-filename').textContent = `✓ ${fileInput.files[0].name}`;
+    document.getElementById('spec-filename').textContent = fileInput.files[0].name;
 });
 
 // ── Terminal ───────────────────────────────────────────────────────────────
@@ -159,7 +159,7 @@ async function startAgent() {
   const activeTab = document.querySelector('.tab.active').dataset.tab;
   const btn = document.getElementById('run-btn');
   btn.disabled = true;
-  btn.textContent = '⏳ EXÉCUTION EN COURS...';
+  btn.textContent = 'EXÉCUTION EN COURS...';
   document.getElementById('agent-status').textContent = '● RUNNING';
   document.getElementById('agent-status').style.color = '#4ADE80';
   document.getElementById('live-dot').style.display = 'inline-block';
@@ -242,7 +242,7 @@ function handleResults(data) {
 
   const rate = total > 0 ? ((passed / total) * 100).toFixed(1) : '0.0';
   appendToTerminal(
-    `✓ Campagne terminée — ${passed}/${total} tests réussis (${rate}%)`,
+    `Campagne terminée — ${passed}/${total} tests réussis (${rate}%)`,
     'success'
   );
 }
@@ -286,7 +286,7 @@ function renderCrossBrowserMatrix(matrix, browsers) {
       const statuses = Object.values(data.browsers).map(v => v.status || '');
       const hasFail = statuses.some(s => s === 'FAILED');
       const hasPass = statuses.some(s => s === 'PASSED');
-      return (hasFail && hasPass) ? ' ⚠️' : '';
+      return '';
     })();
     html += `<td class="status-${overall}" style="font-size:0.72rem;font-weight:700">${(data.overall || 'SKIP').substring(0, 4).toUpperCase()}${mixed}</td></tr>`;
   });
@@ -358,7 +358,7 @@ async function loadRun(filename) {
 function resetUI() {
   const btn = document.getElementById('run-btn');
   btn.disabled = false;
-  btn.textContent = '▶ LANCER LES TESTS';
+  btn.textContent = 'LANCER LES TESTS';
   document.getElementById('agent-status').textContent = '● IDLE';
   document.getElementById('agent-status').style.color = '';
   document.getElementById('live-dot').style.display = 'none';

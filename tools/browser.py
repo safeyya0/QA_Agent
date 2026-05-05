@@ -112,11 +112,15 @@ class BrowserWrapper:
             "button:has-text('Register')",
             "button:has-text('Continue')",
             "button:has-text('Next')",
+            "button:has-text('Search')",
+            "button:has-text('Go')",
+            "button:has-text('Send')",
             "[role='button'][type='submit']",
             "form button:not([type='button'])",
             ".btn[type='submit']",
             ".btn-primary",
             "#submit",
+            "button[type='button']",
         ]
 
         for sel in submit_selectors:
@@ -127,6 +131,13 @@ class BrowserWrapper:
                     return
             except Exception:
                 continue
+
+        # Last resort: press Enter on the first visible input
+        try:
+            await self.page.locator("input:visible").first.press("Enter")
+            return
+        except Exception:
+            pass
 
         raise Exception("Submit button not found.")
 

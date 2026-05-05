@@ -243,35 +243,134 @@ def _parse_json_array(raw: str, model, messages: list, retries: int = 2) -> list
 
 # ── Public LLM functions ──────────────────────────────────────────────────────
 
-def generate_test_cases(fields: list, url: str, auth_info: dict | None = None) -> list:
-    model = get_llm_spec(max_tokens=1500)
+def generate_test_cases(fields: list, url: str, auth_info: dict | None = None,
+                        page_text: str = "") -> list:
+    model = get_llm_spec(max_tokens=1800)
     has_register = (auth_info or {}).get("has_register", False)
+    has_login    = (auth_info or {}).get("has_login",    False)
+    is_auth_form = has_login or has_register
 
     field_names = json.dumps([f.get("name") or f.get("id") or f for f in fields])
-
-    system_prompt = (
-        "You are a senior QA Engineer. Generate exactly 8 test cases for the login form.\n\n"
-        "Cover these scenarios:\n"
-        "1. Wrong password (valid email, wrong password)\n"
-        "2. Wrong email (non-existent email)\n"
-        "3. Both fields empty\n"
-        "4. Invalid email format (e.g. notanemail)\n"
-        "5. SQL injection: ' OR '1'='1\n"
-        "6. XSS: <script>alert(1)</script>\n"
-        "7. Very long input (100+ chars)\n"
-        f"8. {'Valid login (correct credentials)' if has_register else 'Whitespace-only input'}\n\n"
-        "RULES:\n"
-        "- Use exact field names from the fields list.\n"
-        "- description ≤ 45 chars, values ≤ 20 chars, expected ≤ 45 chars.\n"
-        "- Steps: exactly 2 items per test case.\n\n"
-        'Return ONLY this JSON object — no markdown, no text outside it:\n'
-        '{"test_cases":[{"id":"TC001","description":"...","steps":[{"field":"...","value":"..."},{"field":"...","value":"..."}],"expected":"..."}]}'
+    page_hint   = f"\nPage content snippet:\n{page_text[:600]}\n" if page_text else ""
+    footer      = f"URL: {url}\nFields: {field_names}{page_hint}"
+    _fmt        = (
+        'Return ONLY a valid JSON object — no markdown, no text outside it:\n'
+        '{"test_cases":[{"id":"TC001","description":"...","steps":[{"field":"...","value":"..."}],"expected":"..."}]}'
     )
 
-    human_prompt = f"URL: {url}\nFields: {field_names}\nGenerate exactly 8 test cases."
+    if is_auth_form:
+        valid_login = (
+            "10. Valid login — use credentials visible on the page if shown, else use standard_user/secret_sauce. Expected: redirect away from login page."
+            if has_login else
+            "10. Whitespace-only in all fields. Expected: form stays or shows validation error."
+        )
+        # ── Pass 1: core auth scenarios ──────────────────────────────────────
+        sys_p1 = (
+            "You are a senior QA Engineer. Generate exactly 10 test cases for this login/auth form.\n\n"
+            "Cover:\n"
+            "1. Wrong password (valid username, wrong password)\n"
+            "2. Wrong username (non-existent user)\n"
+            "3. Both fields empty\n"
+            "4. Only username filled, password empty\n"
+            "5. Only password filled, username empty\n"
+            "6. SQL injection in username: ' OR '1'='1\n"
+            "7. XSS in username: <script>alert(1)</script>\n"
+            "8. Very long username (100+ chars)\n"
+            "9. Very long password (100+ chars)\n"
+            f"{valid_login}\n\n"
+            "RULES: Use EXACT field names from the list. description ≤ 45 chars, values ≤ 30 chars, "
+            "expected ≤ 45 chars. Steps: 2 items per test case. "
+            "If credentials are visible in page content, use them for case 10.\n\n" + _fmt
+        )
+        msgs_p1 = [SystemMessage(content=sys_p1), HumanMessage(content=footer + "\nGenerate 10 test cases.")]
+        pass1 = _parse_json_array(_invoke(model, msgs_p1), model, msgs_p1)
+        for i, tc in enumerate(pass1, 1):
+            tc["id"] = f"TC{i:03d}"
+        print(f"[LLM] Pass 1 (auth core): {len(pass1)} test cases.")
 
-    messages = [SystemMessage(content=system_prompt), HumanMessage(content=human_prompt)]
-    return _parse_json_array(_invoke(model, messages), model, messages)
+        # ── Pass 2: security & boundary ───────────────────────────────────────
+        covered = json.dumps([tc.get("description", "")[:40] for tc in pass1])
+        n2 = len(pass1) + 1
+        sys_p2 = (
+            "You are a senior QA Engineer. Generate exactly 8 MORE test cases for this login form — "
+            "scenarios NOT already covered.\n\n"
+            "Cover ONLY:\n"
+            "- Username with spaces / tabs\n"
+            "- Unicode characters in username (e.g. 用户名)\n"
+            "- Email format as username (user@domain.com)\n"
+            "- Case sensitivity (USERNAME vs username)\n"
+            "- Null bytes or control characters\n"
+            "- Password with special chars: !@#$%\n"
+            "- Repeated failed logins (brute-force simulation)\n"
+            "- Leading/trailing spaces in credentials\n\n"
+            f"Do NOT repeat: {covered}\n"
+            f"Start IDs at TC{n2:03d}. Steps: 2 items. description/expected ≤ 45 chars.\n\n" + _fmt
+        )
+        msgs_p2 = [SystemMessage(content=sys_p2), HumanMessage(content=footer + "\nGenerate 8 security/boundary test cases.")]
+        try:
+            pass2 = _parse_json_array(_invoke(model, msgs_p2), model, msgs_p2)
+            for i, tc in enumerate(pass2):
+                tc["id"] = f"TC{n2 + i:03d}"
+            print(f"[LLM] Pass 2 (auth security): {len(pass2)} test cases.")
+        except ValueError as e:
+            print(f"[LLM] Pass 2 failed — skipping. ({e})")
+            pass2 = []
+
+    else:
+        # ── Pass 1: generic form functional + security ────────────────────────
+        sys_p1 = (
+            "You are a senior QA Engineer. Generate exactly 10 test cases for the form fields detected.\n\n"
+            "Cover:\n"
+            "1. Valid typical input — normal expected value\n"
+            "2. Empty submission — all fields blank\n"
+            "3. Very long input (100+ chars)\n"
+            "4. Special characters: !@#$%^&*()\n"
+            "5. SQL injection: ' OR '1'='1\n"
+            "6. XSS: <script>alert(1)</script>\n"
+            "7. Numeric-only input in text fields\n"
+            "8. Unicode / emoji: 😀🔥\n"
+            "9. Whitespace-only input\n"
+            "10. Input with newlines or carriage returns\n\n"
+            "RULES: Use EXACT field names from the list — never invent 'username' or 'password'. "
+            "description ≤ 45 chars, values ≤ 30 chars, expected ≤ 45 chars. Steps: 1 item per case.\n\n" + _fmt
+        )
+        msgs_p1 = [SystemMessage(content=sys_p1), HumanMessage(content=footer + "\nGenerate 10 test cases.")]
+        pass1 = _parse_json_array(_invoke(model, msgs_p1), model, msgs_p1)
+        for i, tc in enumerate(pass1, 1):
+            tc["id"] = f"TC{i:03d}"
+        print(f"[LLM] Pass 1 (generic form): {len(pass1)} test cases.")
+
+        # ── Pass 2: boundary & validation ─────────────────────────────────────
+        covered = json.dumps([tc.get("description", "")[:40] for tc in pass1])
+        n2 = len(pass1) + 1
+        sys_p2 = (
+            "You are a senior QA Engineer. Generate exactly 8 MORE test cases for this form — "
+            "edge cases NOT already covered.\n\n"
+            "Cover ONLY:\n"
+            "- Maximum allowed length exactly\n"
+            "- One character below minimum length\n"
+            "- HTML tags without script: <b>bold</b>\n"
+            "- URL as input value\n"
+            "- Email format input\n"
+            "- Negative numbers\n"
+            "- Copy-paste with hidden characters\n"
+            "- All caps input\n\n"
+            f"Do NOT repeat: {covered}\n"
+            f"Start IDs at TC{n2:03d}. Steps: 1 item. description/expected ≤ 45 chars.\n\n" + _fmt
+        )
+        msgs_p2 = [SystemMessage(content=sys_p2), HumanMessage(content=footer + "\nGenerate 8 edge case test cases.")]
+        try:
+            pass2 = _parse_json_array(_invoke(model, msgs_p2), model, msgs_p2)
+            for i, tc in enumerate(pass2):
+                tc["id"] = f"TC{n2 + i:03d}"
+            print(f"[LLM] Pass 2 (generic edge): {len(pass2)} test cases.")
+        except ValueError as e:
+            print(f"[LLM] Pass 2 failed — skipping. ({e})")
+            pass2 = []
+
+    total = pass1 + pass2
+    print(f"[LLM] Total generated: {len(total)} test cases.")
+    return total
 
 
 def generate_tests_from_spec(spec_text: str, fields: list, url: str) -> list:

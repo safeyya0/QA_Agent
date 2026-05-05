@@ -25,7 +25,7 @@
 
       <!-- Input Source Card -->
       <div class="card" style="margin-bottom:1rem">
-        <div class="card-header">&#9889; Source de Test</div>
+        <div class="card-header">Source de Test</div>
         <div class="card-body">
           <div class="tab-bar">
             <div class="tab active" data-tab="url">URL</div>
@@ -44,7 +44,7 @@
           <!-- Spec tab -->
           <div id="tab-spec" style="display:none">
             <div class="drop-zone" id="drop-zone">
-              <div class="drop-zone-icon">&#128196;</div>
+              <div class="drop-zone-icon">+</div>
               <div>Glisser-d&eacute;poser un fichier .md, .txt ou .pdf</div>
               <div style="font-size:0.75rem;margin-top:0.3rem">ou cliquer pour parcourir</div>
               <input type="file" id="spec-file" accept=".md,.txt,.pdf,.sfd" style="display:none">
@@ -60,23 +60,23 @@
 
       <!-- Browser Selection Card -->
       <div class="card" style="margin-bottom:1rem">
-        <div class="card-header">&#127760; Navigateurs</div>
+        <div class="card-header">Navigateurs</div>
         <div class="card-body">
           <div class="browser-grid">
             <label class="browser-option selected" data-browser="chromium">
-              <span class="browser-check"></span>&#128992; Chromium
+              <span class="browser-check"></span>Chromium
             </label>
             <label class="browser-option" data-browser="firefox">
-              <span class="browser-check"></span>&#129418; Firefox
+              <span class="browser-check"></span>Firefox
             </label>
             <label class="browser-option" data-browser="webkit">
-              <span class="browser-check"></span>&#129519; WebKit
+              <span class="browser-check"></span>WebKit
             </label>
             <label class="browser-option" data-browser="chrome">
-              <span class="browser-check"></span>&#128309; Chrome
+              <span class="browser-check"></span>Chrome
             </label>
             <label class="browser-option" data-browser="edge">
-              <span class="browser-check"></span>&#128311; Edge
+              <span class="browser-check"></span>Edge
             </label>
           </div>
           <div style="display:flex;justify-content:space-between;align-items:center;margin-top:0.6rem">
@@ -93,7 +93,7 @@
 
       <!-- Run Button -->
       <button class="btn-primary" id="run-btn" onclick="startAgent()">
-        &#9654; LANCER LES TESTS
+        LANCER LES TESTS
       </button>
 
       <!-- Progress -->
@@ -109,7 +109,7 @@
 
       <!-- Past Runs -->
       <div class="card" style="margin-top:1rem">
-        <div class="card-header">&#128196; Historique</div>
+        <div class="card-header">Historique</div>
         <div class="card-body" style="padding:0.75rem">
           <div id="runs-list" style="font-size:0.82rem;color:var(--neutral)">Chargement...</div>
         </div>
@@ -124,7 +124,7 @@
       <div class="card" style="margin-bottom:1rem">
         <div class="card-header">
           <span class="live-dot" id="live-dot" style="display:none"></span>
-          &#128223; Logs en Temps R&eacute;el
+          Logs en Temps R&eacute;el
         </div>
         <div class="terminal" id="terminal">
           <span style="color:#4A5568">// En attente d&apos;ex&eacute;cution &mdash; OMNISHORE QA Agent pr&ecirc;t</span>
@@ -154,10 +154,10 @@
       <!-- Results Card -->
       <div class="card" id="results-card" style="display:none">
         <div class="card-header" style="justify-content:space-between">
-          <span>&#128202; R&eacute;sultats &amp; Matrice Cross-Browser</span>
+          <span>R&eacute;sultats &amp; Matrice Cross-Browser</span>
           <button class="btn-download" id="download-btn" style="display:none"
                   onclick="downloadReport()">
-            &#128196; T&eacute;l&eacute;charger Rapport Word
+            T&eacute;l&eacute;charger Rapport Word
           </button>
         </div>
         <div class="card-body" style="overflow-x:auto">

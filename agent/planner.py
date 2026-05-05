@@ -13,11 +13,8 @@ class Planner:
 
         print(f"[THINK] Auth detection — has_login={auth_info['has_login']}, has_register={auth_info['has_register']}")
         print(f"[THINK] Generating test cases using LLM for {len(fields)} fields...")
-        test_cases = generate_test_cases(fields, url, auth_info)
+        test_cases = generate_test_cases(fields, url, auth_info, page_text)
         print(f"[THINK] Generated {len(test_cases)} LLM test cases.")
-
-        if not auth_info.get("has_register"):
-            test_cases = [tc for tc in test_cases if not self._is_valid_login_test(tc)]
 
         if auth_info["has_login"] or auth_info["has_register"]:
             test_cases = [self._auth_scenario(auth_info)] + test_cases

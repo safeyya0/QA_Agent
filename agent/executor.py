@@ -1,6 +1,7 @@
 import re
 import asyncio
 import traceback
+from urllib.parse import urlparse as _urlparse
 from tools.browser import BrowserWrapper
 from tools.auth import generate_test_credentials, find_and_click_logout, find_login_link
 
@@ -50,20 +51,24 @@ class Executor:
             current_url = await self.browser.get_page_url()
             has_error = await self.browser.has_error_message()
 
-            is_invalid = bool(re.search(r'\b(fail|error|invalid|incorrect|wrong|reject)\b', expected, re.IGNORECASE))
-            is_valid   = not is_invalid and bool(re.search(r'\b(success|log\s+in|dashboard|valid)\b', expected, re.IGNORECASE))
+            is_invalid = bool(re.search(r'\b(fail|error|invalid|incorrect|wrong|reject|empty)\b', expected, re.IGNORECASE))
+            is_valid   = not is_invalid and bool(re.search(r'\b(success|log\s*in|dashboard|valid|redirect|inventory|home|welcome|logged)\b', expected, re.IGNORECASE))
+
+            origin_path = _urlparse(url).path.rstrip("/") or "/"
 
             passed = False
             if is_valid:
                 for _ in range(6):
                     current_url = await self.browser.get_page_url()
                     has_error   = await self.browser.has_error_message()
-                    if not has_error and url not in current_url:
+                    current_path = _urlparse(current_url).path.rstrip("/") or "/"
+                    if not has_error and current_path != origin_path:
                         passed = True
                         break
                     await asyncio.sleep(0.5)
             elif is_invalid:
-                passed = has_error or url in current_url
+                current_path = _urlparse(current_url).path.rstrip("/") or "/"
+                passed = has_error or current_path == origin_path
             else:
                 passed = True
 
