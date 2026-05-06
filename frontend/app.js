@@ -15,8 +15,11 @@ document.querySelectorAll('.tab').forEach(tab => {
   tab.addEventListener('click', () => {
     document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
     tab.classList.add('active');
-    document.getElementById('tab-url').style.display = tab.dataset.tab === 'url' ? 'block' : 'none';
-    document.getElementById('tab-spec').style.display = tab.dataset.tab === 'spec' ? 'block' : 'none';
+    const isSpec = tab.dataset.tab === 'spec';
+    document.getElementById('tab-url').style.display  = isSpec ? 'none'  : 'block';
+    document.getElementById('tab-spec').style.display = isSpec ? 'block' : 'none';
+    const browserCard = document.getElementById('browser-card');
+    if (browserCard) browserCard.style.display = isSpec ? 'none' : '';
   });
 });
 
@@ -151,12 +154,13 @@ function updateProgress(data) {
 
 // ── Start agent ────────────────────────────────────────────────────────────
 async function startAgent() {
-  if (selectedBrowsers.length === 0) {
+  const activeTab = document.querySelector('.tab.active').dataset.tab;
+  // In spec mode the browser card is hidden — use chromium silently
+  const browsers = activeTab === 'spec' ? ['chromium'] : selectedBrowsers;
+  if (browsers.length === 0) {
     alert('Sélectionnez au moins un navigateur.');
     return;
   }
-
-  const activeTab = document.querySelector('.tab.active').dataset.tab;
   const btn = document.getElementById('run-btn');
   btn.disabled = true;
   btn.textContent = 'EXÉCUTION EN COURS...';
@@ -183,7 +187,7 @@ async function startAgent() {
       if (!url) { alert('Entrez une URL.'); resetUI(); return; }
       const formData = new FormData();
       formData.append('url', url);
-      formData.append('browsers', selectedBrowsers.join(','));
+      formData.append('browsers', browsers.join(','));
       response = await fetch('/api/run-agent', { method: 'POST', body: formData });
     } else {
       const file = fileInput.files[0];
@@ -192,7 +196,7 @@ async function startAgent() {
       const formData = new FormData();
       if (file) formData.append('spec_file', file);
       formData.append('url', specUrl || '');
-      formData.append('browsers', selectedBrowsers.join(','));
+      formData.append('browsers', browsers.join(','));
       response = await fetch('/api/run-agent-with-spec', { method: 'POST', body: formData });
     }
 

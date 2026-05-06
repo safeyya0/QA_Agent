@@ -3,14 +3,18 @@ import io
 import os
 import re
 import json
+import time
+import logging
 from langchain_groq import ChatGroq
 from langchain.messages import SystemMessage, HumanMessage, AIMessage
 from dotenv import load_dotenv
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
 
-def get_llm(max_tokens: int = 2000):
+
+def get_llm(max_tokens: int = 4096):
     """Fast small model — used for simple/single-shot tasks."""
     return ChatGroq(
         api_key=os.getenv("GROQ_API_KEY"),
@@ -20,7 +24,7 @@ def get_llm(max_tokens: int = 2000):
 
 
 def get_llm_spec(max_tokens: int = 2000):
-    """Larger model used for multi-pass spec generation — better JSON compliance."""
+    """Larger model used for spec generation — kept at 2000 to stay within Groq 6k TPM."""
     return ChatGroq(
         api_key=os.getenv("GROQ_API_KEY"),
         model="llama-3.3-70b-versatile",
@@ -31,7 +35,7 @@ def get_llm_spec(max_tokens: int = 2000):
 # ── JSON extraction helpers ───────────────────────────────────────────────────
 
 def _repair_truncated_array(text: str) -> list | None:
-    """Recover a valid JSON array even if the LLM response was cut off mid-output."""
+    """Recover completed objects from a truncated JSON array or dict-wrapped array."""
     start = text.find("[")
     if start == -1:
         return None
@@ -59,8 +63,12 @@ def _repair_truncated_array(text: str) -> list | None:
                 last_obj_end = i
     if last_obj_end == -1:
         return None
+    chunk = _repair_json_syntax(_normalize_literals(text[start : last_obj_end + 1] + "]"))
     try:
-        return json.loads(text[start : last_obj_end + 1] + "]")
+        result = json.loads(chunk)
+        if isinstance(result, list) and result:
+            return result
+        return None
     except Exception:
         return None
 
@@ -71,18 +79,31 @@ def _repair_json_syntax(text: str) -> str:
 
 
 def _normalize_literals(text: str) -> str:
-    """Replace Python literals with JSON equivalents."""
+    """Replace Python/JS literals with JSON equivalents."""
     text = re.sub(r"\bNone\b", "null", text)
     text = re.sub(r"\bTrue\b", "true", text)
     text = re.sub(r"\bFalse\b", "false", text)
+    # Replace JS string expressions like "a".repeat(20) → "aaaaaaaa" (capped at 20 chars)
+    def _replace_repeat(m):
+        char = m.group(1)
+        n    = min(int(m.group(2)), 20)
+        return f'"{char * n}"'
+    text = re.sub(r'"(.)"\s*\.\s*repeat\s*\(\s*(\d+)\s*\)', _replace_repeat, text)
+    # Replace JS template literals `abc` → "abc"
+    text = re.sub(r'`([^`]*)`', r'"\1"', text)
     return text
 
 
 def _clean_raw(raw: str) -> str:
-    """Strip markdown fences and leading/trailing noise from LLM output."""
+    """Strip markdown fences and preamble text before the first JSON structure."""
     text = raw
     for fence in ("```json", "```JSON", "```"):
         text = text.replace(fence, "")
+    text = text.strip()
+    # Remove any preamble text before the opening [ or {
+    m = re.search(r'[\[{]', text)
+    if m and m.start() > 0:
+        text = text[m.start():]
     return text.strip()
 
 
@@ -188,15 +209,22 @@ def _is_truncated(text: str) -> bool:
 
 
 def _invoke(model, messages: list) -> str:
-    """Invoke the model, retrying once with a smaller token budget on 413."""
-    try:
-        return model.invoke(messages).content
-    except Exception as e:
-        if "413" in str(e) or "too large" in str(e).lower() or "tokens" in str(e).lower():
-            print("[LLM] Request too large — retrying with reduced token budget...")
-            smaller = get_llm(max_tokens=1000)
-            return smaller.invoke(messages).content
-        raise
+    """Invoke the model with rate-limit retry and context fallback."""
+    wait_times = [65, 90, 120]
+    for attempt, wait in enumerate(wait_times):
+        try:
+            return model.invoke(messages).content
+        except Exception as e:
+            err = str(e)
+            if "429" in err or "rate limit" in err.lower() or "rate_limit" in err.lower():
+                logger.warning("Rate limit — waiting %ds (attempt %d/%d)…", wait, attempt + 1, len(wait_times))
+                time.sleep(wait)
+                continue
+            if "413" in err or "too large" in err.lower() or "context length" in err.lower():
+                logger.warning("Context too large — retrying with smaller model…")
+                return get_llm(max_tokens=2000).invoke(messages).content
+            raise
+    raise ValueError("[LLM] Rate limit still active after retries — skipping this pass.")
 
 
 def _parse_json_array(raw: str, model, messages: list, retries: int = 2) -> list:
@@ -208,30 +236,27 @@ def _parse_json_array(raw: str, model, messages: list, retries: int = 2) -> list
 
         if result is not None:
             if attempt > 0:
-                print(f"[LLM] Recovered {len(result)} test cases on attempt {attempt + 1}.")
+                logger.info("Recovered %d test cases on attempt %d.", len(result), attempt + 1)
             return result
 
-        # Log a snippet so we can see what the model actually returned
         snippet = text[:200].replace("\n", " ")
-        print(f"[LLM] Parse attempt {attempt + 1} failed. Response starts with: {snippet!r}")
+        logger.warning("Parse attempt %d failed. Response starts with: %r", attempt + 1, snippet)
 
         if attempt < retries:
             if _is_truncated(text):
-                print(f"[LLM] Response truncated — retrying with shorter output request...")
+                logger.info("Response truncated — retrying with fewer cases…")
                 fix_msg = (
-                    "Your response was cut off before the JSON was complete. "
-                    "Regenerate but keep each test case VERY SHORT: "
-                    "description under 50 chars, steps array max 2 items with values under 25 chars, "
-                    "expected under 50 chars. "
-                    'Return ONLY: {"test_cases": [{...}, ...]} — no markdown, no text outside the JSON.'
+                    "Your response was cut off. Regenerate with ONLY 4 test cases total. "
+                    "Each case: description ≤ 40 chars, 2-3 steps max, expected ≤ 40 chars. "
+                    'Return ONLY: {"test_cases": [{"id":"TC001","description":"...","steps":[...],"expected":"..."},...]}'
+                    " — no markdown, no text outside the JSON."
                 )
             else:
-                print(f"[LLM] JSON parse failed — retrying with format reminder...")
+                logger.info("JSON parse failed — retrying with format reminder…")
                 fix_msg = (
                     "Your previous response could not be parsed as JSON. "
-                    'Return ONLY a JSON object like: {"test_cases": [{"id": "TC001", '
-                    '"description": "...", "steps": [{"field": "x", "value": "y"}], "expected": "..."}]}. '
-                    "No markdown, no code fences, no explanation, no text before or after."
+                    'Return ONLY: {"test_cases": [{"id":"TC001","description":"...","steps":[{"action":"fill","field":"x","value":"y"},{"action":"submit"}],"expected":"..."}]}. '
+                    "No markdown, no code fences, no text outside the JSON."
                 )
             current = _invoke(model, messages + [
                 AIMessage(content=current),
@@ -245,220 +270,190 @@ def _parse_json_array(raw: str, model, messages: list, retries: int = 2) -> list
 
 def generate_test_cases(fields: list, url: str, auth_info: dict | None = None,
                         page_text: str = "") -> list:
-    model = get_llm_spec(max_tokens=1800)
-    has_register = (auth_info or {}).get("has_register", False)
-    has_login    = (auth_info or {}).get("has_login",    False)
-    is_auth_form = has_login or has_register
-
-    field_names = json.dumps([f.get("name") or f.get("id") or f for f in fields])
-    page_hint   = f"\nPage content snippet:\n{page_text[:600]}\n" if page_text else ""
-    footer      = f"URL: {url}\nFields: {field_names}{page_hint}"
-    _fmt        = (
-        'Return ONLY a valid JSON object — no markdown, no text outside it:\n'
-        '{"test_cases":[{"id":"TC001","description":"...","steps":[{"field":"...","value":"..."}],"expected":"..."}]}'
-    )
-
-    if is_auth_form:
-        valid_login = (
-            "10. Valid login — use credentials visible on the page if shown, else use standard_user/secret_sauce. Expected: redirect away from login page."
-            if has_login else
-            "10. Whitespace-only in all fields. Expected: form stays or shows validation error."
-        )
-        # ── Pass 1: core auth scenarios ──────────────────────────────────────
-        sys_p1 = (
-            "You are a senior QA Engineer. Generate exactly 10 test cases for this login/auth form.\n\n"
-            "Cover:\n"
-            "1. Wrong password (valid username, wrong password)\n"
-            "2. Wrong username (non-existent user)\n"
-            "3. Both fields empty\n"
-            "4. Only username filled, password empty\n"
-            "5. Only password filled, username empty\n"
-            "6. SQL injection in username: ' OR '1'='1\n"
-            "7. XSS in username: <script>alert(1)</script>\n"
-            "8. Very long username (100+ chars)\n"
-            "9. Very long password (100+ chars)\n"
-            f"{valid_login}\n\n"
-            "RULES: Use EXACT field names from the list. description ≤ 45 chars, values ≤ 30 chars, "
-            "expected ≤ 45 chars. Steps: 2 items per test case. "
-            "If credentials are visible in page content, use them for case 10.\n\n" + _fmt
-        )
-        msgs_p1 = [SystemMessage(content=sys_p1), HumanMessage(content=footer + "\nGenerate 10 test cases.")]
-        pass1 = _parse_json_array(_invoke(model, msgs_p1), model, msgs_p1)
-        for i, tc in enumerate(pass1, 1):
-            tc["id"] = f"TC{i:03d}"
-        print(f"[LLM] Pass 1 (auth core): {len(pass1)} test cases.")
-
-        # ── Pass 2: security & boundary ───────────────────────────────────────
-        covered = json.dumps([tc.get("description", "")[:40] for tc in pass1])
-        n2 = len(pass1) + 1
-        sys_p2 = (
-            "You are a senior QA Engineer. Generate exactly 8 MORE test cases for this login form — "
-            "scenarios NOT already covered.\n\n"
-            "Cover ONLY:\n"
-            "- Username with spaces / tabs\n"
-            "- Unicode characters in username (e.g. 用户名)\n"
-            "- Email format as username (user@domain.com)\n"
-            "- Case sensitivity (USERNAME vs username)\n"
-            "- Null bytes or control characters\n"
-            "- Password with special chars: !@#$%\n"
-            "- Repeated failed logins (brute-force simulation)\n"
-            "- Leading/trailing spaces in credentials\n\n"
-            f"Do NOT repeat: {covered}\n"
-            f"Start IDs at TC{n2:03d}. Steps: 2 items. description/expected ≤ 45 chars.\n\n" + _fmt
-        )
-        msgs_p2 = [SystemMessage(content=sys_p2), HumanMessage(content=footer + "\nGenerate 8 security/boundary test cases.")]
-        try:
-            pass2 = _parse_json_array(_invoke(model, msgs_p2), model, msgs_p2)
-            for i, tc in enumerate(pass2):
-                tc["id"] = f"TC{n2 + i:03d}"
-            print(f"[LLM] Pass 2 (auth security): {len(pass2)} test cases.")
-        except ValueError as e:
-            print(f"[LLM] Pass 2 failed — skipping. ({e})")
-            pass2 = []
-
-    else:
-        # ── Pass 1: generic form functional + security ────────────────────────
-        sys_p1 = (
-            "You are a senior QA Engineer. Generate exactly 10 test cases for the form fields detected.\n\n"
-            "Cover:\n"
-            "1. Valid typical input — normal expected value\n"
-            "2. Empty submission — all fields blank\n"
-            "3. Very long input (100+ chars)\n"
-            "4. Special characters: !@#$%^&*()\n"
-            "5. SQL injection: ' OR '1'='1\n"
-            "6. XSS: <script>alert(1)</script>\n"
-            "7. Numeric-only input in text fields\n"
-            "8. Unicode / emoji: 😀🔥\n"
-            "9. Whitespace-only input\n"
-            "10. Input with newlines or carriage returns\n\n"
-            "RULES: Use EXACT field names from the list — never invent 'username' or 'password'. "
-            "description ≤ 45 chars, values ≤ 30 chars, expected ≤ 45 chars. Steps: 1 item per case.\n\n" + _fmt
-        )
-        msgs_p1 = [SystemMessage(content=sys_p1), HumanMessage(content=footer + "\nGenerate 10 test cases.")]
-        pass1 = _parse_json_array(_invoke(model, msgs_p1), model, msgs_p1)
-        for i, tc in enumerate(pass1, 1):
-            tc["id"] = f"TC{i:03d}"
-        print(f"[LLM] Pass 1 (generic form): {len(pass1)} test cases.")
-
-        # ── Pass 2: boundary & validation ─────────────────────────────────────
-        covered = json.dumps([tc.get("description", "")[:40] for tc in pass1])
-        n2 = len(pass1) + 1
-        sys_p2 = (
-            "You are a senior QA Engineer. Generate exactly 8 MORE test cases for this form — "
-            "edge cases NOT already covered.\n\n"
-            "Cover ONLY:\n"
-            "- Maximum allowed length exactly\n"
-            "- One character below minimum length\n"
-            "- HTML tags without script: <b>bold</b>\n"
-            "- URL as input value\n"
-            "- Email format input\n"
-            "- Negative numbers\n"
-            "- Copy-paste with hidden characters\n"
-            "- All caps input\n\n"
-            f"Do NOT repeat: {covered}\n"
-            f"Start IDs at TC{n2:03d}. Steps: 1 item. description/expected ≤ 45 chars.\n\n" + _fmt
-        )
-        msgs_p2 = [SystemMessage(content=sys_p2), HumanMessage(content=footer + "\nGenerate 8 edge case test cases.")]
-        try:
-            pass2 = _parse_json_array(_invoke(model, msgs_p2), model, msgs_p2)
-            for i, tc in enumerate(pass2):
-                tc["id"] = f"TC{n2 + i:03d}"
-            print(f"[LLM] Pass 2 (generic edge): {len(pass2)} test cases.")
-        except ValueError as e:
-            print(f"[LLM] Pass 2 failed — skipping. ({e})")
-            pass2 = []
-
-    total = pass1 + pass2
-    print(f"[LLM] Total generated: {len(total)} test cases.")
-    return total
+    """Autonomous test generation for URL mode — delegates to the 2-phase approach."""
+    page_context: dict = {}
+    if auth_info:
+        if auth_info.get("has_login"):
+            page_context["auth_type"] = "login"
+        elif auth_info.get("has_register"):
+            page_context["auth_type"] = "register"
+    return generate_quick_test_cases(fields, url, page_text, page_context or None)
 
 
 def generate_tests_from_spec(spec_text: str, fields: list, url: str) -> list:
-    # llama3-70b-8192 has 8192 token context — keep inputs lean
-    model = get_llm_spec(max_tokens=1800)
+    model    = get_llm_spec(max_tokens=2000)
+    has_url  = bool(url and url.strip())
 
     fields_section = (
         f"Detected form fields on {url}:\n{json.dumps(fields, indent=2)}"
-        if fields else "No live page fields detected — generate tests based on the spec alone."
+        if fields else "No live page fields — generate a narrative test plan from the spec."
     )
-    url_section = f"Target URL: {url}" if url else "No URL provided — generate a test plan only."
-    # Keep spec snippet short enough to stay comfortably within 8192 tokens
-    spec_body = spec_text[:2500]
-    common_footer = f"\n{url_section}\n\n{fields_section}\n\nSpecification excerpt:\n---\n{spec_body}\n---\n"
-
-    _json_fmt = (
-        'Return ONLY a valid JSON object in this exact format — no markdown, no text outside the JSON:\n'
-        '{"test_cases": [{"id": "TC001", "description": "...", '
-        '"steps": [{"field": "fieldName", "value": "testValue"}], "expected": "..."}, ...]}'
+    url_section   = f"Target URL: {url}" if has_url else "No URL — this is a test plan document only."
+    spec_body     = spec_text[:2500]
+    common_footer = (
+        f"\n{url_section}\n\n{fields_section}\n\n"
+        f"Specification:\n---\n{spec_body}\n---\n"
     )
 
-    # Pass 1: happy paths + business rules
+    if has_url:
+        # ── With URL: interactive steps (fill/submit/wait) ────────────────────
+        _step_fmt = (
+            'Steps use action objects:\n'
+            '  {"action":"fill","field":"fieldName","value":"val"}\n'
+            '  {"action":"submit"}\n'
+            '  {"action":"wait","value":"2"}\n'
+            '  {"action":"clear","field":"fieldName"}\n'
+            'Every scenario MUST have at least 3 steps and one {"action":"submit"}.\n'
+        )
+        _json_fmt = (
+            'Return ONLY valid JSON — no markdown, no text outside it:\n'
+            '{"test_cases":[{"id":"TC001","description":"...","steps":[{"action":"fill","field":"...","value":"..."},{"action":"submit"}],"expected":"..."}]}'
+        )
+    else:
+        # ── Plan only: narrative describe steps — no real form interactions ───
+        _step_fmt = (
+            'Since there is no live URL, steps must be NARRATIVE DESCRIPTIONS of system behavior.\n'
+            'Use this step format:\n'
+            '  {"action":"describe","value":"Plain English description of what happens in this step"}\n'
+            '  {"action":"wait","value":"10"}  — when a timeout or delay is part of the scenario\n'
+            'Every scenario MUST have at least 4 describe steps that tell the complete story.\n'
+            'Steps should describe: precondition → trigger → system reaction → verification.\n'
+        )
+        _json_fmt = (
+            'Return ONLY valid JSON — no markdown, no text outside it:\n'
+            '{"test_cases":[{"id":"TC001","description":"...","steps":[{"action":"describe","value":"Step description here"}],"expected":"..."}]}'
+        )
+
+    _rules = (
+        "RÈGLES POUR TOUTES LES PASSES — respecter impérativement :\n"
+        "- Rédige les descriptions ET les résultats attendus EN FRANÇAIS\n"
+        "- Chaque scénario est un flux multi-étapes complet (minimum 4 étapes)\n"
+        "- description ≤ 70 chars — décrit le scénario, pas juste un nom de fonctionnalité\n"
+        "- expected ≤ 70 chars — décrit l'état observable final\n"
+        "- Couvre les chemins succès ET échec\n"
+        "- Référence des valeurs, délais et conditions précises issus de la spec\n"
+        "VALIDATION LOGIQUE OBLIGATOIRE (corrige si violé avant de retourner) :\n"
+        "- Ne pas inventer de comportements système absents de la spécification\n"
+        "- Deux entités ne partagent PAS la même ressource exclusive sans spécification explicite\n"
+        "- Chaque requête crée une entité système INDÉPENDANTE sauf mention contraire\n"
+        "- L'état final doit être valide, cohérent et atteignable depuis l'état initial\n"
+        "- Les délais doivent être réalistes (≥ 2s pour les opérations asynchrones réseau)\n"
+        "- Les rôles et permissions doivent respecter strictement la spécification\n\n"
+    )
+
+    # ── Pass 1: business requirements — success + failure per requirement (8 cases) ─
     sys_p1 = (
-        "You are a senior QA Engineer. Generate functional test cases from the specification.\n\n"
-        "Rules:\n"
-        "- For EVERY requirement or user story: one success path AND one failure path.\n"
-        "- For EVERY validation rule: one dedicated test case.\n"
-        "- For EVERY form field: valid input AND one invalid input.\n"
-        "- Target 8-12 test cases. Keep steps arrays to 2 items max.\n"
-        "- Steps must be objects: {\"field\": \"fieldName\", \"value\": \"testValue\"}.\n\n"
-        + _json_fmt
+        "You are a senior QA Engineer. Generate exactly 8 system-level scenarios "
+        "derived directly from the specification.\n\n"
+        + _rules +
+        "Coverage rules for this pass:\n"
+        "- For EVERY functional requirement: one success flow AND one failure flow\n"
+        "- For EVERY user story: a complete happy-path scenario\n"
+        "- For EVERY role mentioned: at least one scenario from that role's perspective\n"
+        "- For EVERY business rule or constraint: a dedicated scenario\n\n"
+        + _step_fmt + "\n" + _json_fmt
     )
-    msgs_p1 = [SystemMessage(content=sys_p1), HumanMessage(content=common_footer + "\nGenerate test cases now.")]
+    msgs_p1 = [SystemMessage(content=sys_p1), HumanMessage(content=common_footer + "\nGenerate 8 scenarios.")]
     pass1 = _parse_json_array(_invoke(model, msgs_p1), model, msgs_p1)
-    print(f"[LLM] Pass 1: {len(pass1)} test cases.")
+    for i, tc in enumerate(pass1, 1):
+        tc["id"] = f"TC{i:03d}"
+    logger.info("Pass 1 (requirements): %d scenarios.", len(pass1))
 
-    # Pass 2: boundaries, edge cases, security
-    covered = json.dumps([tc.get("description", "")[:40] for tc in pass1])
+    logger.info("Waiting 65s between passes to stay within Groq TPM quota…")
+    time.sleep(65)
+
+    # ── Pass 2: validation, boundaries, security (7 cases) ───────────────────
+    covered = json.dumps([tc.get("description", "")[:50] for tc in pass1])
     n2 = len(pass1) + 1
     sys_p2 = (
-        "You are a senior QA Engineer doing a gap-analysis pass.\n\n"
-        "Generate ONLY these types of test cases (gaps not yet covered):\n"
-        "- Empty/blank fields\n"
-        "- Max-length strings\n"
-        "- XSS: <script>alert(1)</script>\n"
-        "- SQL injection: ' OR '1'='1\n"
-        "- Multiple invalid fields simultaneously\n\n"
-        f"Generate exactly 5 test cases. Start IDs at TC{n2:03d}.\n"
+        "You are a senior QA Engineer. Generate exactly 7 ADDITIONAL scenarios — "
+        "NOT already covered — focused on validation, boundaries, and security.\n\n"
+        + _rules +
+        "Coverage rules for this pass:\n"
+        "- Empty / blank input flows\n"
+        "- Maximum length boundary values\n"
+        "- SQL injection attempt\n"
+        "- XSS injection attempt\n"
+        "- Invalid formats (wrong email, wrong date, negative numbers)\n"
+        "- Special characters and unicode\n"
+        "- Missing mandatory fields\n\n"
         f"Do NOT repeat: {covered}\n"
-        "Steps must be objects: {\"field\": \"fieldName\", \"value\": \"testValue\"}.\n\n"
-        + _json_fmt
+        f"Start IDs at TC{n2:03d}.\n\n"
+        + _step_fmt + "\n" + _json_fmt
     )
-    msgs_p2 = [SystemMessage(content=sys_p2), HumanMessage(content=common_footer + "\nGenerate gap test cases now.")]
+    msgs_p2 = [SystemMessage(content=sys_p2), HumanMessage(content=common_footer + "\nGenerate 7 security/boundary scenarios.")]
     try:
         pass2 = _parse_json_array(_invoke(model, msgs_p2), model, msgs_p2)
         for i, tc in enumerate(pass2):
             tc["id"] = f"TC{n2 + i:03d}"
-        print(f"[LLM] Pass 2: {len(pass2)} additional test cases.")
-    except ValueError as e:
-        print(f"[LLM] Pass 2 failed — skipping. ({e})")
+        logger.info("Pass 2 (security/boundary): %d scenarios.", len(pass2))
+    except Exception as e:
+        logger.warning("Pass 2 failed — skipping. (%s)", e)
         pass2 = []
 
-    # Pass 3: end-to-end workflows & integration
-    all_covered = json.dumps([tc.get("description", "")[:40] for tc in pass1 + pass2])
+    logger.info("Waiting 70s between passes to stay within Groq TPM quota…")
+    time.sleep(70)
+
+    # ── Pass 3: end-to-end journeys & integration flows (6 cases) ────────────
+    all_so_far = json.dumps([tc.get("description", "")[:50] for tc in pass1 + pass2])
     n3 = n2 + len(pass2)
     sys_p3 = (
-        "You are a senior QA Engineer doing a final workflow pass.\n\n"
-        "Generate ONLY multi-step end-to-end scenarios not yet covered:\n"
-        "- Complete user journeys from the spec\n"
-        "- Role-based access if roles are mentioned\n"
-        "- Out-of-order or skipped steps\n\n"
-        f"Generate exactly 5 test cases. Start IDs at TC{n3:03d}.\n"
-        f"Do NOT repeat: {all_covered}\n"
-        "Steps must be objects: {\"field\": \"fieldName\", \"value\": \"testValue\"}.\n\n"
-        + _json_fmt
+        "You are a senior QA Engineer. Generate exactly 6 end-to-end JOURNEY scenarios — "
+        "complete user flows spanning multiple steps and states.\n\n"
+        + _rules +
+        "Coverage rules for this pass:\n"
+        "- Full lifecycle flows (create → use → cancel / delete)\n"
+        "- Cross-role interactions (e.g. rider requests → driver accepts → completes)\n"
+        "- Timeout and retry behaviors (e.g. no response within N seconds → fallback)\n"
+        "- State transitions (pending → active → completed → rated)\n"
+        "- Error recovery journeys (failure → retry → success)\n"
+        "- Cancellation flows mid-process\n\n"
+        f"Do NOT repeat: {all_so_far}\n"
+        f"Start IDs at TC{n3:03d}.\n\n"
+        + _step_fmt + "\n" + _json_fmt
     )
-    msgs_p3 = [SystemMessage(content=sys_p3), HumanMessage(content=common_footer + "\nGenerate workflow test cases now.")]
+    msgs_p3 = [SystemMessage(content=sys_p3), HumanMessage(content=common_footer + "\nGenerate 6 journey scenarios.")]
     try:
         pass3 = _parse_json_array(_invoke(model, msgs_p3), model, msgs_p3)
         for i, tc in enumerate(pass3):
             tc["id"] = f"TC{n3 + i:03d}"
-        print(f"[LLM] Pass 3: {len(pass3)} workflow test cases.")
-    except ValueError as e:
-        print(f"[LLM] Pass 3 failed — skipping. ({e})")
+        logger.info("Pass 3 (journeys): %d scenarios.", len(pass3))
+    except Exception as e:
+        logger.warning("Pass 3 failed — skipping. (%s)", e)
         pass3 = []
 
-    total = pass1 + pass2 + pass3
-    print(f"[LLM] Total from spec: {len(total)} test cases across 3 passes.")
+    logger.info("Waiting 70s between passes to stay within Groq TPM quota…")
+    time.sleep(70)
+
+    # ── Pass 4: edge cases, concurrency, non-functional (5 cases) ────────────
+    all_covered = json.dumps([tc.get("description", "")[:50] for tc in pass1 + pass2 + pass3])
+    n4 = n3 + len(pass3)
+    sys_p4 = (
+        "You are a senior QA Engineer. Generate exactly 5 ADDITIONAL scenarios covering "
+        "edge cases and non-functional aspects — NOT already covered.\n\n"
+        + _rules +
+        "Coverage rules for this pass:\n"
+        "- Concurrency: two users performing same action simultaneously\n"
+        "- Data integrity: verify no side effects after a failed operation\n"
+        "- Performance boundary: action under time constraint\n"
+        "- Permission denied: unauthorized role attempts restricted action\n"
+        "- Network interruption simulation: wait mid-flow then continue\n\n"
+        f"Do NOT repeat: {all_covered}\n"
+        f"Start IDs at TC{n4:03d}.\n\n"
+        + _step_fmt + "\n" + _json_fmt
+    )
+    msgs_p4 = [SystemMessage(content=sys_p4), HumanMessage(content=common_footer + "\nGenerate 5 edge-case scenarios.")]
+    try:
+        pass4 = _parse_json_array(_invoke(model, msgs_p4), model, msgs_p4)
+        for i, tc in enumerate(pass4):
+            tc["id"] = f"TC{n4 + i:03d}"
+        logger.info("Pass 4 (edge cases): %d scenarios.", len(pass4))
+    except Exception as e:
+        logger.warning("Pass 4 failed — skipping. (%s)", e)
+        pass4 = []
+
+    total = pass1 + pass2 + pass3 + pass4
+    logger.info("Total from spec: %d scenarios across 4 passes.", len(total))
     return total
 
 
@@ -468,6 +463,14 @@ def extract_spec_text(file_content: bytes, filename: str) -> str:
         from pypdf import PdfReader
         reader = PdfReader(io.BytesIO(file_content))
         return "\n".join(page.extract_text() or "" for page in reader.pages)
+    if lower.endswith((".docx", ".doc")):
+        try:
+            import docx
+            from docx import Document
+            doc = Document(io.BytesIO(file_content))
+            return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+        except Exception as e:
+            return f"[Could not extract .docx content: {e}]"
     return file_content.decode("utf-8", errors="replace")
 
 
@@ -498,5 +501,341 @@ def generate_conclusion_with_llm(report_summary: dict) -> str | None:
         result = model.invoke([HumanMessage(content=prompt)])
         return result.content.strip()
     except Exception as e:
-        print(f"[LLM] Conclusion generation failed (llama3-70b): {e}")
+        logger.warning("Conclusion generation failed: %s", e)
         return None
+
+
+def _build_interface_context(fields: list, url: str,
+                              page_text: str = "",
+                              page_context: dict | None = None) -> str:
+    """Build a rich textual description of the interface for the LLM."""
+    ctx = page_context or {}
+
+    field_details = []
+    for f in fields:
+        name = f.get("name") or f.get("id") or ""
+        if not name:
+            continue  # skip fields with no usable identifier — fill_form handles them dynamically
+        parts = []
+        if f.get("label"):       parts.append(f"label='{f['label']}'")
+        if f.get("placeholder"): parts.append(f"placeholder='{f['placeholder']}'")
+        if f.get("type"):        parts.append(f"type={f['type']}")
+        field_details.append(f"{name} ({', '.join(parts)})" if parts else name)
+
+    lines = [f"URL: {url}"]
+
+    # Auth context (highest priority — specialised prompts generated later)
+    if ctx.get("auth_type") == "login":
+        lines.append("Form type: LOGIN — test valid credentials, wrong password, SQL injection, empty fields, locked account, case sensitivity")
+    elif ctx.get("auth_type") == "register":
+        lines.append("Form type: REGISTER — test valid signup, duplicate email, weak password, required fields, format validation")
+
+    # Generic page type label (from Planner.detect_page_context)
+    if ctx.get("page_type_label"):
+        lines.append(f"Page type: {ctx['page_type_label']}")
+    elif ctx.get("page_type") and ctx["page_type"] not in ("auth",):
+        type_labels = {
+            "crud_list": "CRUD_LIST — page with data table and Add/Edit/Delete buttons. Focus on Create→Read→Update→Delete flows.",
+            "data_list": "DATA_LIST — read-only data table. Focus on verifying data loads, search/filter if present.",
+            "data_form": "DATA_FORM — form for creating or editing a record. Focus on valid submit, missing required fields, boundary values.",
+            "general":   "GENERAL — informational page. Verify key content is visible.",
+        }
+        label = type_labels.get(ctx["page_type"])
+        if label:
+            lines.append(f"Page type: {label}")
+
+    if ctx.get("title"):
+        lines.append(f"Page title: {ctx['title']}")
+    if ctx.get("headings"):
+        lines.append(f"Headings: {' | '.join(ctx['headings'][:5])}")
+    if ctx.get("labels"):
+        lines.append(f"Labels: {' | '.join(ctx['labels'][:12])}")
+    if ctx.get("buttons"):
+        lines.append(f"Buttons/Links: {' | '.join(ctx['buttons'][:10])}")
+    if ctx.get("action_links"):
+        unique = list(dict.fromkeys(ctx["action_links"]))[:15]
+        lines.append(f"All clickable: {' | '.join(unique)}")
+    if ctx.get("selects"):
+        for sel in ctx["selects"][:4]:
+            opts = ", ".join(sel.get("options", [])[:6])
+            lines.append(f"Dropdown '{sel.get('name','')}': [{opts}]")
+    if ctx.get("has_table"):
+        row_info = f"{ctx.get('row_count', 0)} rows"
+        header_info = ""
+        if ctx.get("table_headers"):
+            header_info = f", columns: {' | '.join(ctx['table_headers'])}"
+        lines.append(f"Data table present ({row_info}{header_info}) — CRUD likely")
+    if field_details:
+        lines.append(f"Form fields: {json.dumps(field_details)}")
+    if page_text:
+        lines.append(f"Page text excerpt: {page_text[:250]}")
+
+    return "\n".join(lines)
+
+
+_ACTIONS_DOC = (
+    'Available step actions:\n'
+    '  {"action":"fill","field":"EXACT_FIELD_ID","value":"val"}  — fill a KNOWN field by id/name\n'
+    '  {"action":"fill_form","value":"hint text"}                — fill ALL visible fields on current page (use after click opens a form)\n'
+    '  {"action":"select","field":"EXACT_FIELD_ID","value":"opt"}— pick dropdown option\n'
+    '  {"action":"click","text":"Exact Button Text"}             — click button/link using EXACT text from "All clickable" or "Buttons/Links"\n'
+    '  {"action":"check","field":"checkboxName"}                 — tick checkbox\n'
+    '  {"action":"navigate","value":"/path"}                     — go to URL path\n'
+    '  {"action":"submit"}                                       — submit the current form\n'
+    '  {"action":"verify_text","value":"keyword"}                — assert keyword appears on page (use after submit)\n'
+    '\n'
+    '=== MANDATORY PATTERNS — always follow these ===\n'
+    '\n'
+    'ADD/CREATE (when you see "Add", "New", "Create" buttons):\n'
+    '  {"action":"click","text":"<exact Add button text>"},\n'
+    '  {"action":"fill_form","value":"<test name or value>"},\n'
+    '  {"action":"submit"},\n'
+    '  {"action":"verify_text","value":"Successfully"}\n'
+    '\n'
+    'EDIT/UPDATE (when you see "Edit", "Modify" buttons):\n'
+    '  {"action":"click","text":"<exact Edit button text>"},\n'
+    '  {"action":"fill_form","value":"<updated value>"},\n'
+    '  {"action":"submit"},\n'
+    '  {"action":"verify_text","value":"Successfully"}\n'
+    '\n'
+    'DELETE/REMOVE (when you see "Delete", "Remove" buttons):\n'
+    '  {"action":"click","text":"<exact Delete button text>"},\n'
+    '  {"action":"verify_text","value":"Successfully"}\n'
+    '  (dialogs are auto-confirmed — no extra step needed)\n'
+    '\n'
+    'FORM VALIDATION (fields already visible on page):\n'
+    '  {"action":"fill","field":"<exact id>","value":"<value>"},\n'
+    '  {"action":"submit"},\n'
+    '  {"action":"verify_text","value":"<expected keyword>"}\n'
+)
+
+_OUTPUT_RULES = (
+    'OUTPUT RULES (strictly enforced):\n'
+    '- 2 to 5 steps per scenario\n'
+    '- click: EXACT text from "Buttons/Links" or "All clickable" — never invent button text\n'
+    '- fill: ONLY when field id/name is listed in "Form fields" section\n'
+    '- fill_form: use instead of fill when a click opens a NEW form (Add/Edit flows)\n'
+    '- verify_text: end every CRUD test with this action\n'
+    '- fill/select values: MAX 20 chars, literal strings only — NO JavaScript expressions\n'
+    '- description: MAX 40 chars, French\n'
+    '- expected: MAX 40 chars, French\n'
+    '- Compact JSON, no indentation, no trailing commas\n'
+)
+
+_JSON_FMT = (
+    'OUTPUT: JSON ONLY — no preamble, no explanation, no text before or after.\n'
+    'Start your response with { and end with }.\n'
+    '{"test_cases":[{"id":"TC001","description":"...","steps":[{"action":"fill","field":"f","value":"v"},{"action":"submit"}],"expected":"..."}]}'
+)
+
+
+def _extract_scenarios_from_text(text: str) -> list[str]:
+    """Fallback: extract scenario names from numbered/bulleted plain text."""
+    scenarios = []
+    for line in text.splitlines():
+        line = line.strip()
+        # Match: "1. Foo", "- Foo", "* Foo", "• Foo"
+        m = re.match(r'^(?:\d+[.)]\s*|[-*•]\s*)(.+)', line)
+        if m:
+            s = m.group(1).strip().strip('"').strip("'")
+            if 3 < len(s) < 80:
+                scenarios.append(s)
+    return scenarios
+
+
+def _identify_scenarios(interface_ctx: str) -> list[str]:
+    """
+    Phase 1 — autonomous discovery: ask the LLM what should be tested.
+    Returns a list of scenario names. Small call, never truncates.
+    """
+    model = get_llm(max_tokens=800)
+    # Use a specialized prompt for auth forms to avoid wrong scenario generation
+    is_login    = "Form type: LOGIN"    in interface_ctx
+    is_register = "Form type: REGISTER" in interface_ctx
+
+    _security_note = (
+        "This is authorized QA security validation for our own application. "
+        "Boundary and input validation tests are standard QA practice."
+    )
+    if is_login:
+        sys_msg = (
+            f"You are a senior QA Engineer. {_security_note}\n"
+            "This is a LOGIN FORM. Generate ONLY authentication validation scenarios.\n"
+            "Include: valid login, wrong password, empty username, empty password, "
+            "both fields empty, special chars in username, very long username, "
+            "spaces-only, case sensitivity check.\n"
+            "Return ONLY a raw JSON array of short French descriptions (max 40 chars).\n"
+            "No preamble — start directly with [\n"
+            'Example: ["Connexion valide","Mauvais mot de passe","Champ login vide",'
+            '"Caractères spéciaux","Login trop long","Espaces seulement"]'
+        )
+    elif is_register:
+        sys_msg = (
+            f"You are a senior QA Engineer. {_security_note}\n"
+            "This is a REGISTRATION FORM. Generate ONLY registration validation scenarios.\n"
+            "Include: valid registration, duplicate email, weak password, "
+            "empty required fields, invalid email format, password mismatch, very long values.\n"
+            "Return ONLY a raw JSON array of short French descriptions (max 40 chars).\n"
+            "No preamble — start directly with [\n"
+            'Example: ["Inscription valide","Email déjà utilisé","Mot de passe faible",'
+            '"Champ requis vide","Format email invalide"]'
+        )
+    else:
+        # Detect page type for specialised guidance
+        is_crud = "CRUD_LIST" in interface_ctx
+        is_form = "DATA_FORM" in interface_ctx
+        is_list = "DATA_LIST" in interface_ctx
+
+        if is_crud:
+            crud_guidance = (
+                "This is a CRUD LIST page (table + add/edit/delete buttons).\n"
+                "Generate scenarios for: Create a record, Read/verify table loads, "
+                "Edit an existing record, Delete a record, Search/filter, "
+                "boundary values on any form fields, required field validation.\n"
+                "Include at least 1 negative test (missing required field).\n"
+            )
+        elif is_form:
+            crud_guidance = (
+                "This is a DATA FORM page (form for creating/editing).\n"
+                "Generate scenarios for: Valid submission, missing required field, "
+                "boundary values (very long input, special characters), "
+                "invalid format (wrong email, negative number), empty submission.\n"
+                "Include at least 1 negative test.\n"
+            )
+        elif is_list:
+            crud_guidance = (
+                "This is a DATA LIST page (read-only table).\n"
+                "Generate scenarios for: Verify data loads, search/filter if present, "
+                "pagination if present, verify column headers visible.\n"
+            )
+        else:
+            crud_guidance = (
+                "Scan all buttons and links. For each CRUD button: generate a scenario.\n"
+                "For forms: valid submit + at least 1 invalid input scenario.\n"
+            )
+
+        sys_msg = (
+            f"You are a senior QA Engineer performing authorized QA testing. {_security_note}\n\n"
+            f"{crud_guidance}\n"
+            "ALSO check:\n"
+            "  - 'All clickable' / 'Buttons/Links': Add/Edit/Delete/Search buttons → one scenario each\n"
+            "  - 'Form fields': empty required, invalid format, boundary length\n"
+            "  - 'Data table present': verify it loads\n\n"
+            "Return ONLY a raw JSON array of short French descriptions (max 40 chars each).\n"
+            "No preamble — start directly with [\n"
+            'Example: ["Ajouter un employé","Modifier un employé","Supprimer",'
+            '"Rechercher par nom","Champ requis vide","Valeur limite"]'
+        )
+    try:
+        msgs = [SystemMessage(content=sys_msg), HumanMessage(content=interface_ctx)]
+        raw  = _invoke(model, msgs)
+        text = _clean_raw(raw)
+        logger.debug("Scenario discovery raw (%d chars): %r", len(text), text[:120])
+
+        # Try JSON parse first
+        result = _try_parse_array(text) or _extract_json_array(text)
+
+        if isinstance(result, list) and result:
+            # If the LLM returned test-case dicts instead of strings, extract descriptions
+            if all(isinstance(s, dict) for s in result):
+                scenarios = [
+                    (s.get("description") or s.get("title") or "")[:50]
+                    for s in result
+                    if (s.get("description") or s.get("title") or "").strip()
+                ]
+            else:
+                scenarios = [s for s in result if isinstance(s, str) and s.strip()]
+
+            if scenarios:
+                logger.info("Identified %d scenarios autonomously.", len(scenarios))
+                return scenarios
+
+        fallback = _extract_scenarios_from_text(text)
+        if fallback:
+            logger.info("Identified %d scenarios via text fallback.", len(fallback))
+            return fallback
+
+        logger.warning("Could not parse any scenarios — raw: %r", text[:300])
+    except Exception as e:
+        logger.warning("Scenario identification failed: %s", e)
+    return []
+
+
+def _generate_batch(scenarios: list[str], interface_ctx: str,
+                    start_id: int) -> list[dict]:
+    """
+    Phase 2 — generate test cases for a small batch of scenario names.
+    Batch of 2 max to avoid truncation.
+    """
+    model = get_llm(max_tokens=2500)
+    scenario_list = "\n".join(f"{i+1}. {s}" for i, s in enumerate(scenarios))
+    _VERIFY_RULE = (
+        "verify_text RULE — value must be a SHORT keyword (max 15 chars) that WILL appear:\n"
+        "  Success cases: 'Successfully', 'saved', 'added', 'deleted', 'updated'\n"
+        "  Error cases:   'Invalid', 'required', 'incorrect', 'error'\n"
+        "  Login success: 'Dashboard' or 'Welcome'\n"
+        "  NEVER use full sentences, NEVER invent messages you are not sure about.\n"
+        "  If unsure what text appears, use 'Successfully' for success or 'Invalid' for error.\n"
+    )
+    sys_msg = (
+        "You are a senior QA Engineer. Generate test cases for these specific scenarios.\n\n"
+        + _ACTIONS_DOC + "\n"
+        + _OUTPUT_RULES + "\n"
+        + _VERIFY_RULE + "\n"
+        + _JSON_FMT
+    )
+    user_msg = (
+        f"{interface_ctx}\n\n"
+        f"Generate test cases for EXACTLY these scenarios:\n{scenario_list}\n"
+        f"Start IDs at TC{start_id:03d}."
+    )
+    try:
+        msgs = [SystemMessage(content=sys_msg), HumanMessage(content=user_msg)]
+        raw   = _invoke(model, msgs)
+        cases = _parse_json_array(raw, model, msgs, retries=1)
+        for i, tc in enumerate(cases):
+            tc["id"] = f"TC{start_id + i:03d}"
+        return cases
+    except Exception as e:
+        logger.warning("Batch generation failed: %s", e)
+        return []
+
+
+def generate_quick_test_cases(fields: list, url: str,
+                               page_text: str = "",
+                               page_context: dict | None = None) -> list:
+    """
+    Fully autonomous 2-phase test generation:
+    Phase 1 — LLM identifies ALL scenarios worth testing (no count limit).
+    Phase 2 — generates test cases in batches of 3 (never truncates).
+    """
+    interface_ctx = _build_interface_context(fields, url, page_text, page_context)
+    logger.info("generate_quick_test_cases called for %s (%d fields)", url, len(fields))
+
+    scenarios = _identify_scenarios(interface_ctx)
+    if not scenarios:
+        logger.info("No scenarios identified for %s — returning empty.", url)
+        return []
+
+    if len(scenarios) > 15:
+        logger.info("Capping scenarios %d → 15", len(scenarios))
+        scenarios = scenarios[:15]
+
+    logger.info("Autonomous plan: %d scenarios for %s", len(scenarios), url)
+
+    # Brief cooldown after the scenario-identification call before starting batches
+    # — prevents back-to-back requests that immediately hit the 6k TPM limit
+    time.sleep(3)
+
+    # Phase 2: generate in batches of 2 (avoids truncation on verbose responses)
+    all_cases: list = []
+    batch_size = 2
+    for i in range(0, len(scenarios), batch_size):
+        batch = scenarios[i : i + batch_size]
+        cases = _generate_batch(batch, interface_ctx, start_id=len(all_cases) + 1)
+        all_cases.extend(cases)
+        if i + batch_size < len(scenarios):
+            time.sleep(5)  # pause between batches to stay within 6k TPM
+
+    logger.info("Generated %d test cases for %s", len(all_cases), url)
+    return all_cases

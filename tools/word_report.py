@@ -1,10 +1,13 @@
 import os
+import logging
 from datetime import datetime
 from docx import Document
 from docx.shared import Pt, RGBColor, Inches, Cm
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
+
+logger = logging.getLogger(__name__)
 
 # ── OMNISHORE brand palette ───────────────────────────────────────────────────
 C = {
@@ -693,17 +696,24 @@ def _methodology(doc):
         size=9.5, color=C["slate"], before=2, after=8)
 
 
-def _test_card(doc, res: dict, index: int):
-    overall = res.get("overall", "UNKNOWN")
-    bg      = STATUS_BG.get(overall, "F8FAFC")
-    fg      = STATUS_FG.get(overall, C["muted"])
-    label   = STATUS_FR.get(overall, overall)
-    sev, sev_color = _severity(overall, res.get("description", ""), res.get("expected", ""))
+def _test_card(doc, res: dict, index: int, seen_screenshots: set) -> None:
+    """Render one test case.  All tables go to doc level — no nested table mixing.
 
-    # Card header
+    seen_screenshots: mutable set of already-inserted screenshot paths; used to
+    deduplicate images across the report.
+    """
+    overall        = res.get("overall", "UNKNOWN")
+    bg             = STATUS_BG.get(overall, "F8FAFC")
+    fg             = STATUS_FG.get(overall, C["muted"])
+    label          = STATUS_FR.get(overall, overall)
+    sev, sev_color = _severity(overall, res.get("description", ""), res.get("expected", ""))
+    is_auth        = res.get("type") == "auth_flow"
+
+    # ── 1. Header table (ID + description | status badge) ─────────────────────
     h_tbl = doc.add_table(rows=1, cols=2)
     h_tbl.style = "Table Grid"
-    lc = h_tbl.cell(0, 0); rc = h_tbl.cell(0, 1)
+    lc = h_tbl.cell(0, 0)
+    rc = h_tbl.cell(0, 1)
     _cell_bg(lc, C["navy2"]); _cell_bg(rc, bg)
     _cell_border(lc, fg, "8"); _cell_border(rc, fg, "8")
 
@@ -725,66 +735,79 @@ def _test_card(doc, res: dict, index: int):
     badge.bold = True; badge.font.size = Pt(11); badge.font.name = "Calibri"
     badge.font.color.rgb = _rgb(fg)
 
-    # Card body
-    b_tbl = doc.add_table(rows=1, cols=1)
-    b_tbl.style = "Table Grid"
-    bc = b_tbl.cell(0, 0)
-    _cell_bg(bc, C["gray_bg"]); _cell_border(bc, "E2E8F0")
-
-    def _bl(label, value, val_color=None, italic=False):
-        p = bc.add_paragraph()
-        p.paragraph_format.space_before = Pt(2)
-        p.paragraph_format.space_after  = Pt(2)
-        lr = p.add_run(f"{label} : ")
-        lr.bold = True; lr.font.size = Pt(8.5); lr.font.name = "Calibri"
-        lr.font.color.rgb = _rgb(C["muted"])
-        vr = p.add_run(str(value) if value else "—")
+    # ── 2. Info table (type / expected / severity) — doc level, NOT nested ────
+    info_rows = [
+        ("Type de test",      "Flux d'authentification complet" if is_auth else "Test fonctionnel"),
+        ("Résultat attendu",  res.get("expected") or "—"),
+        ("Sévérité",          sev),
+    ]
+    info_tbl = doc.add_table(rows=len(info_rows), cols=2)
+    info_tbl.style = "Table Grid"
+    for ri, (k, v) in enumerate(info_rows):
+        kc = info_tbl.rows[ri].cells[0]
+        vc = info_tbl.rows[ri].cells[1]
+        _cell_bg(kc, C["light"]); _cell_bg(vc, C["white"])
+        _cell_border(kc, "E2E8F0"); _cell_border(vc, "E2E8F0")
+        kr = kc.paragraphs[0].add_run(k)
+        kr.bold = True; kr.font.size = Pt(8.5); kr.font.name = "Calibri"
+        kr.font.color.rgb = _rgb(C["muted"])
+        vr = vc.paragraphs[0].add_run(_safe(v))
         vr.font.size = Pt(8.5); vr.font.name = "Calibri"
-        vr.italic = italic
-        vr.font.color.rgb = _rgb(val_color or C["slate"])
+        vr.font.color.rgb = _rgb(sev_color if ri == 2 else C["slate"])
 
-    bc.paragraphs[0].paragraph_format.space_before = Pt(4)
-    bc.paragraphs[0].paragraph_format.space_after  = Pt(0)
-
-    is_auth = res.get("type") == "auth_flow"
-    _bl("Type de test", "Flux d'authentification complet" if is_auth else "Test fonctionnel standard")
-    _bl("Résultat attendu", res.get("expected", "—"))
-    _bl("Sévérité / Priorité", sev, val_color=sev_color)
-
-    # Steps table
+    # ── 3. Steps table — doc level ────────────────────────────────────────────
     steps = res.get("steps", [])
     if steps and not is_auth:
-        sp = bc.add_paragraph()
-        sp.paragraph_format.space_before = Pt(5)
-        sr = sp.add_run("Données de test — Étapes d'exécution :")
-        sr.bold = True; sr.font.size = Pt(8.5); sr.font.name = "Calibri"
-        sr.font.color.rgb = _rgb(C["muted"])
+        is_narrative = any(s.get("action") == "describe" for s in steps)
+        _subsection(doc, "Scénario narratif :" if is_narrative else "Étapes d'exécution :")
 
-        st_tbl = doc.add_table(rows=len(steps) + 1, cols=3)
-        st_tbl.style = "Table Grid"
-        for ci, hdr in enumerate(["#", "Champ", "Valeur saisie"]):
-            c = st_tbl.rows[0].cells[ci]
-            _cell_bg(c, C["navy2"])
-            r = c.paragraphs[0].add_run(hdr)
-            r.bold = True; r.font.size = Pt(8); r.font.name = "Calibri"
-            r.font.color.rgb = _rgb(C["white"])
-        for si, step in enumerate(steps, start=1):
-            row = st_tbl.rows[si].cells
-            _cell_bg(row[0], C["light"]); _cell_bg(row[1], C["white"]); _cell_bg(row[2], C["white"])
-            row[0].paragraphs[0].add_run(str(si)).font.size = Pt(8)
-            row[1].paragraphs[0].add_run(_safe(step.get("field", "—"))).font.size = Pt(8)
-            row[2].paragraphs[0].add_run(_safe(step.get("value", "—"))[:80]).font.size = Pt(8)
+        if is_narrative:
+            for si, step in enumerate(steps, 1):
+                action = step.get("action", "describe")
+                value  = _safe(step.get("value") or "")
+                p = doc.add_paragraph()
+                p.paragraph_format.space_before = Pt(1)
+                p.paragraph_format.space_after  = Pt(2)
+                p.paragraph_format.left_indent  = Pt(14)
+                idx_r = p.add_run(f"{si}.  ")
+                idx_r.bold = True; idx_r.font.size = Pt(8.5); idx_r.font.name = "Calibri"
+                idx_r.font.color.rgb = _rgb(C["accent"])
+                if action == "wait":
+                    vr2 = p.add_run(f"[Délai : {value} s]")
+                    vr2.italic = True; vr2.font.size = Pt(8.5)
+                    vr2.font.color.rgb = _rgb(C["neutral"])
+                else:
+                    vr2 = p.add_run(value)
+                    vr2.font.size = Pt(8.5); vr2.font.name = "Calibri"
+                    vr2.font.color.rgb = _rgb(C["slate"])
+        else:
+            st_tbl = doc.add_table(rows=len(steps) + 1, cols=4)
+            st_tbl.style = "Table Grid"
+            for ci, hdr in enumerate(["#", "Action", "Champ / Cible", "Valeur"]):
+                c = st_tbl.rows[0].cells[ci]
+                _cell_bg(c, C["navy2"])
+                r = c.paragraphs[0].add_run(hdr)
+                r.bold = True; r.font.size = Pt(8); r.font.name = "Calibri"
+                r.font.color.rgb = _rgb(C["white"])
+            for si, step in enumerate(steps, 1):
+                row = st_tbl.rows[si].cells
+                _cell_bg(row[0], C["light"])
+                for ci2 in (1, 2, 3):
+                    _cell_bg(row[ci2], C["white"])
+                row[0].paragraphs[0].add_run(str(si)).font.size = Pt(8)
+                row[1].paragraphs[0].add_run(_safe(step.get("action", "—"))).font.size = Pt(8)
+                row[2].paragraphs[0].add_run(
+                    _safe(step.get("field") or step.get("text") or "—")
+                ).font.size = Pt(8)
+                row[3].paragraphs[0].add_run(
+                    _safe(step.get("value", "—"))[:80]
+                ).font.size = Pt(8)
         doc.add_paragraph()
 
-    # Auth sub-steps
+    # ── 4. Auth sub-steps table — doc level ───────────────────────────────────
     auth_steps = res.get("auth_steps", [])
     if is_auth and auth_steps:
-        ap = bc.add_paragraph()
-        ap.paragraph_format.space_before = Pt(5)
-        ar = ap.add_run("Déroulement du flux d'authentification :")
-        ar.bold = True; ar.font.size = Pt(8.5); ar.font.name = "Calibri"
-        ar.font.color.rgb = _rgb(C["muted"])
-
+        _subsection(doc, "Déroulement du flux d'authentification :")
         a_tbl = doc.add_table(rows=len(auth_steps) + 1, cols=4)
         a_tbl.style = "Table Grid"
         for ci, hdr in enumerate(["Étape", "Nom", "Statut", "Observation"]):
@@ -794,13 +817,13 @@ def _test_card(doc, res: dict, index: int):
             r.bold = True; r.font.size = Pt(8); r.font.name = "Calibri"
             r.font.color.rgb = _rgb(C["white"])
             c.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
-        for si, step in enumerate(auth_steps, start=1):
+        for si, step in enumerate(auth_steps, 1):
             st   = (step.get("status") or "unknown").upper()
             sbg  = STATUS_BG.get(st, C["gray_bg"])
             sfg  = STATUS_FG.get(st, C["muted"])
             row  = a_tbl.rows[si].cells
             _cell_bg(row[0], C["light"]); _cell_bg(row[1], sbg)
-            _cell_bg(row[2], sbg); _cell_bg(row[3], C["white"])
+            _cell_bg(row[2], sbg);        _cell_bg(row[3], C["white"])
             row[0].paragraphs[0].add_run(str(si)).font.size = Pt(8)
             row[0].paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
             step_name = STEP_FR.get(step.get("step", ""), step.get("step", "").replace("_", " ").title())
@@ -809,19 +832,13 @@ def _test_card(doc, res: dict, index: int):
             sr2.bold = True; sr2.font.size = Pt(8); sr2.font.name = "Calibri"
             sr2.font.color.rgb = _rgb(sfg)
             row[2].paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
-            note = (step.get("note") or "")[:150]
-            row[3].paragraphs[0].add_run(note).font.size = Pt(7.5)
+            row[3].paragraphs[0].add_run((step.get("note") or "")[:150]).font.size = Pt(7.5)
         doc.add_paragraph()
 
-    # Per-browser results
+    # ── 5. Per-browser results table — doc level ──────────────────────────────
     browsers_list = res.get("browsers_list", [])
     if browsers_list:
-        bp = bc.add_paragraph()
-        bp.paragraph_format.space_before = Pt(5)
-        br2 = bp.add_run("Résultats par navigateur :")
-        br2.bold = True; br2.font.size = Pt(8.5); br2.font.name = "Calibri"
-        br2.font.color.rgb = _rgb(C["muted"])
-
+        _subsection(doc, "Résultats par navigateur :")
         bw_tbl = doc.add_table(rows=len(browsers_list) + 1, cols=3)
         bw_tbl.style = "Table Grid"
         for ci, hdr in enumerate(["Navigateur", "Statut", "Erreur / Observation"]):
@@ -830,7 +847,7 @@ def _test_card(doc, res: dict, index: int):
             r = c.paragraphs[0].add_run(hdr)
             r.bold = True; r.font.size = Pt(8); r.font.name = "Calibri"
             r.font.color.rgb = _rgb(C["white"])
-        for bi, bl in enumerate(browsers_list, start=1):
+        for bi, bl in enumerate(browsers_list, 1):
             bst = (bl.get("status") or "UNKNOWN").upper()
             bbg = STATUS_BG.get(bst, C["gray_bg"])
             bfg = STATUS_FG.get(bst, C["muted"])
@@ -841,44 +858,59 @@ def _test_card(doc, res: dict, index: int):
             sr3.bold = True; sr3.font.size = Pt(8.5); sr3.font.name = "Calibri"
             sr3.font.color.rgb = _rgb(bfg)
             row[1].paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
-            err = _safe(bl.get("error") or "—")[:120]
-            er = row[2].paragraphs[0].add_run(err)
+            er = row[2].paragraphs[0].add_run(_safe(bl.get("error") or "—")[:120])
             er.font.size = Pt(7.5); er.italic = True; er.font.name = "Calibri"
             er.font.color.rgb = _rgb(C["danger"] if bst == "FAILED" else C["slate"])
         doc.add_paragraph()
 
-    # Result obtained
-    _bl("Résultat obtenu",
-        "Test réussi — comportement conforme au résultat attendu." if overall == "PASSED"
-        else (browsers_list[0].get("error") if browsers_list else None) or "Voir détails ci-dessus",
-        val_color=C["success"] if overall == "PASSED" else C["danger"],
-        italic=(overall != "PASSED"))
+    # ── 6. Result summary line ────────────────────────────────────────────────
+    result_p = doc.add_paragraph()
+    result_p.paragraph_format.space_before = Pt(2)
+    result_p.paragraph_format.space_after  = Pt(4)
+    lr = result_p.add_run("Résultat obtenu : ")
+    lr.bold = True; lr.font.size = Pt(8.5); lr.font.name = "Calibri"
+    lr.font.color.rgb = _rgb(C["muted"])
+    result_text = (
+        "Test réussi — comportement conforme au résultat attendu."
+        if overall == "PASSED"
+        else (
+            next(
+                (bl.get("error") for bl in browsers_list if bl.get("error")),
+                None,
+            ) or "Voir détails ci-dessus"
+        )
+    )
+    vr_res = result_p.add_run(result_text)
+    vr_res.font.size  = Pt(8.5); vr_res.font.name = "Calibri"
+    vr_res.italic     = overall != "PASSED"
+    vr_res.font.color.rgb = _rgb(C["success"] if overall == "PASSED" else C["danger"])
 
-    # Empty line at end of card
-    last = bc.add_paragraph()
-    last.paragraph_format.space_before = Pt(2)
-    last.paragraph_format.space_after  = Pt(4)
-
-    doc.add_paragraph()
-
-    # Screenshot (first one found)
+    # ── 7. Screenshot — deduplicated by path ──────────────────────────────────
     screenshot = next(
-        (bl.get("screenshot") for bl in browsers_list if bl.get("screenshot") and os.path.exists(bl["screenshot"])),
-        None
+        (
+            bl["screenshot"]
+            for bl in browsers_list
+            if bl.get("screenshot")
+            and os.path.exists(bl["screenshot"])
+            and bl["screenshot"] not in seen_screenshots
+        ),
+        None,
     )
     if screenshot:
+        seen_screenshots.add(screenshot)
         try:
             doc.add_picture(screenshot, width=Inches(5.5))
             cap = doc.add_paragraph(
-                f"Figure — Capture d'écran · {res.get('id', '')} · {STATUS_FR.get(overall, overall)}"
+                f"Figure — {res.get('id', '')} · {STATUS_FR.get(overall, overall)}"
             )
             cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
             cap.runs[0].font.size = Pt(7.5)
             cap.runs[0].italic    = True
             cap.runs[0].font.color.rgb = _rgb(C["muted"])
-            doc.add_paragraph()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Could not insert screenshot %s: %s", screenshot, exc)
+
+    doc.add_paragraph()
 
 
 def _defect_analysis(doc, failed_results: list):
@@ -1197,8 +1229,11 @@ def _conclusion(doc, report_data: dict, total, passed, failed, partial, rate, pl
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 def generate_word_report(report_data: dict, browser: str = "chromium",
-                          output_dir: str = "output") -> str:
+                          output_dir: str | None = None) -> str:
     """Generate complete OMNISHORE QA Word report. Returns path to saved .docx file."""
+    from config import REPORT_DIR
+    if output_dir is None:
+        output_dir = REPORT_DIR
     doc = Document()
 
     # Page setup
@@ -1235,7 +1270,27 @@ def generate_word_report(report_data: dict, browser: str = "chromium",
     browsers  = report_data.get("browsers") or [browser]
     browsers_str = ", ".join(b.capitalize() for b in browsers)
 
-    results    = _get_all_results(report_data)
+    raw_results = _get_all_results(report_data)
+
+    # Deduplicate by test ID — log a warning if duplicates were found
+    seen_ids:          set[str] = set()
+    results:           list     = []
+    seen_screenshots:  set[str] = set()   # passed to every _test_card call
+
+    for r in raw_results:
+        tid = r.get("id", "?")
+        if tid in seen_ids:
+            logger.warning("Duplicate test ID '%s' in report data — skipping duplicate.", tid)
+            continue
+        seen_ids.add(tid)
+        results.append(r)
+
+    if len(results) != len(raw_results):
+        logger.warning(
+            "Removed %d duplicate(s) from report (%d raw → %d unique).",
+            len(raw_results) - len(results), len(raw_results), len(results),
+        )
+
     failed_res = [r for r in results if r.get("overall") in ("FAILED", "PARTIAL")]
 
     _cover_page(doc, url, date_fr, browsers_str, total, passed, failed, partial, rate, plan_only)
@@ -1256,12 +1311,12 @@ def generate_word_report(report_data: dict, browser: str = "chromium",
 
     _section_title(doc, "5", "Résultats Détaillés des Cas de Test")
     _para(doc,
-        f"Cette section présente le détail complet de chacun des {total} cas de test exécutés, "
-        "incluant les données saisies, le résultat attendu, le résultat obtenu par navigateur, "
+        f"Cette section présente le détail complet de chacun des {len(results)} cas de test exécutés, "
+        "incluant les actions effectuées, le résultat attendu, le résultat obtenu par navigateur, "
         "la sévérité de l'anomalie le cas échéant, et les captures d'écran associées.",
         size=9.5, color=C["slate"], before=2, after=8)
     for idx, res in enumerate(results, start=1):
-        _test_card(doc, res, idx)
+        _test_card(doc, res, idx, seen_screenshots)
     doc.add_page_break()
 
     _defect_analysis(doc, failed_res)
@@ -1278,9 +1333,22 @@ def generate_word_report(report_data: dict, browser: str = "chromium",
 
     _conclusion(doc, report_data, total, passed, failed, partial, rate, plan_only, url)
 
-    # Save
+    # Save Word report
+    import json
     os.makedirs(output_dir, exist_ok=True)
-    path = os.path.join(output_dir, f"rapport_omnishore_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx")
+    ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(output_dir, f"rapport_omnishore_{ts}.docx")
     doc.save(path)
+    logger.info("Word report saved: %s", path)
     print(f"[REPORT] Word report saved: {path}")
+
+    # Also save JSON snapshot alongside
+    json_path = os.path.join(output_dir, f"rapport_omnishore_{ts}.json")
+    try:
+        with open(json_path, "w", encoding="utf-8") as fh:
+            json.dump(report_data, fh, indent=2, ensure_ascii=False)
+        logger.info("JSON report saved: %s", json_path)
+    except Exception as exc:
+        logger.warning("Could not save JSON report: %s", exc)
+
     return path

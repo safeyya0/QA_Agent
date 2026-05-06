@@ -1,48 +1,180 @@
+"""Planner: classifies page context and drives LLM test-case generation."""
 import re
-from tools.llm import generate_test_cases, generate_tests_from_spec
+import logging
+from typing import Any
+from tools.llm import generate_quick_test_cases, generate_tests_from_spec
 from tools.auth import detect_auth_forms
+
+logger = logging.getLogger(__name__)
+
+# Page context labels
+PAGE_CTX_AUTH      = "auth"       # has password field
+PAGE_CTX_CRUD_LIST = "crud_list"  # table + add/create button
+PAGE_CTX_DATA_LIST = "data_list"  # table, no add button
+PAGE_CTX_DATA_FORM = "data_form"  # form without password
+PAGE_CTX_GENERAL   = "general"    # everything else
 
 
 class Planner:
-    def __init__(self):
-        pass
+    """Turns observed page elements into a structured test plan."""
 
-    def plan(self, fields: list, url: str, page_info: dict | None = None) -> list:
-        page_text = (page_info or {}).get("page_text", "")
-        auth_info = detect_auth_forms(fields, url, page_text)
+    # ── Page context detection ─────────────────────────────────────────────────
 
-        print(f"[THINK] Auth detection — has_login={auth_info['has_login']}, has_register={auth_info['has_register']}")
-        print(f"[THINK] Generating test cases using LLM for {len(fields)} fields...")
-        test_cases = generate_test_cases(fields, url, auth_info, page_text)
-        print(f"[THINK] Generated {len(test_cases)} LLM test cases.")
+    def detect_page_context(self, elements: list[dict[str, Any]]) -> str:
+        """Classify the page type from its element list.
 
-        if auth_info["has_login"] or auth_info["has_register"]:
+        Returns one of the PAGE_CTX_* constants.
+        """
+        field_types = {
+            e["type"] for e in elements if e.get("category") == "form_field"
+        }
+        has_password = "password" in field_types
+        has_table    = any(e.get("category") == "data_display" for e in elements)
+        has_fields   = bool(field_types)
+
+        action_texts = [
+            e["text"].lower()
+            for e in elements
+            if e.get("category") == "action"
+        ]
+        has_add_btn = any(
+            any(kw in t for kw in ("add", "new", "create", "ajouter", "nouveau"))
+            for t in action_texts
+        )
+
+        if has_password:
+            return PAGE_CTX_AUTH
+        if has_table and has_add_btn:
+            return PAGE_CTX_CRUD_LIST
+        if has_table:
+            return PAGE_CTX_DATA_LIST
+        if has_fields:
+            return PAGE_CTX_DATA_FORM
+        return PAGE_CTX_GENERAL
+
+    # ── Live-page planning ─────────────────────────────────────────────────────
+
+    def plan(
+        self,
+        elements: list[dict[str, Any]],
+        url:      str,
+        page_info: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Generate test cases from observed page elements.
+
+        Always produces 3-8 test cases:
+          auth       → valid login, invalid login, empty fields
+          crud_list  → Create → Read → Update → Delete, plus negative tests
+          data_list  → data visible, search/pagination if present
+          data_form  → valid submit, missing required, boundary, invalid type
+          general    → screenshot + document what's on the page
+        """
+        page_text    = (page_info or {}).get("page_text", "")
+        page_context = self.detect_page_context(elements)
+        fields       = [e for e in elements if e.get("category") == "form_field"]
+        auth_info    = detect_auth_forms(fields, url, page_text)
+
+        logger.info(
+            "Planning %s — context=%s  auth_login=%s  auth_register=%s",
+            url, page_context, auth_info["has_login"], auth_info["has_register"],
+        )
+
+        # ── Build rich page_context dict for the LLM ─────────────────────────
+        pi = page_info or {}
+
+        # Unique, non-empty button/link texts
+        action_texts: list[str] = list(dict.fromkeys(
+            e["text"] for e in elements
+            if e.get("category") == "action" and e.get("text", "").strip()
+        ))
+
+        # Form field labels — give the LLM real field names, not just IDs
+        labels: list[str] = list(dict.fromkeys(
+            e["label"] for e in fields if e.get("label", "").strip()
+        ))
+
+        # Select/dropdown options from form fields
+        selects: list[dict] = [
+            {"name": e.get("name") or e.get("id", ""), "options": e.get("options", [])}
+            for e in fields
+            if e.get("type") == "select" and e.get("options")
+        ]
+
+        ctx: dict[str, Any] = {
+            "page_type":    page_context,
+            "buttons":      action_texts[:12],
+            "action_links": action_texts[:15],
+            "has_table":    any(e.get("category") == "data_display" for e in elements),
+        }
+
+        # Page metadata from observer
+        if pi.get("title"):
+            ctx["title"] = pi["title"]
+        if pi.get("headings"):
+            ctx["headings"] = pi["headings"][:6]
+        if labels:
+            ctx["labels"] = labels[:12]
+        if selects:
+            ctx["selects"] = selects[:4]
+
+        # Table metadata
+        tables = [e for e in elements if e.get("category") == "data_display"]
+        if tables:
+            ctx["row_count"] = tables[0].get("row_count", 0)
+            # Column headers help the LLM write specific assertions
+            if tables[0].get("headers"):
+                ctx["table_headers"] = tables[0]["headers"][:8]
+
+        # Auth hint so the LLM generates the right scenario set
+        if page_context == PAGE_CTX_AUTH:
+            if auth_info["has_login"]:
+                ctx["auth_type"] = "login"
+            elif auth_info["has_register"]:
+                ctx["auth_type"] = "register"
+        else:
+            ctx["page_type_label"] = {
+                PAGE_CTX_CRUD_LIST: "CRUD_LIST — page with data table and add/edit/delete buttons",
+                PAGE_CTX_DATA_LIST: "DATA_LIST — read-only data table, possibly with search/filter",
+                PAGE_CTX_DATA_FORM: "DATA_FORM — form page for creating or editing a record",
+                PAGE_CTX_GENERAL:   "GENERAL — informational or dashboard page",
+            }.get(page_context, "")
+
+        test_cases = generate_quick_test_cases(fields, url, page_text[:300], ctx)
+        logger.info("Generated %d test cases for %s (%s)", len(test_cases), url, page_context)
+
+        # Prepend auth-flow meta-test for auth pages
+        if page_context == PAGE_CTX_AUTH:
             test_cases = [self._auth_scenario(auth_info)] + test_cases
 
         return test_cases
 
-    def plan_from_spec(self, spec_text: str, fields: list, url: str, page_info: dict | None = None) -> list:
-        # Pre-pass: extract any explicitly structured TC blocks / requirements from markdown
-        parsed = self.parse_markdown_spec(spec_text)
+    # ── Spec-based planning (no live URL) ──────────────────────────────────────
+
+    def plan_from_spec(
+        self,
+        spec_text: str,
+        fields:    list[dict[str, Any]],
+        url:       str,
+        page_info: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Generate test cases from a specification document."""
+        parsed   = self.parse_markdown_spec(spec_text)
         md_cases = self.build_test_cases_from_parsed_md(parsed)
         if md_cases:
-            print(f"[THINK] Extracted {len(md_cases)} test cases from structured markdown.")
+            logger.info("Extracted %d test cases from structured markdown.", len(md_cases))
 
-        print(f"[THINK] Generating test cases from spec ({len(spec_text)} chars) — 3-pass LLM mode...")
+        logger.info("Generating test cases from spec (%d chars) — 3-pass LLM mode...", len(spec_text))
         llm_cases = generate_tests_from_spec(spec_text, fields, url)
-        print(f"[THINK] Total from LLM: {len(llm_cases)} test cases.")
+        logger.info("Total from LLM: %d test cases.", len(llm_cases))
 
-        # Merge: structured-MD cases first (they have explicit requirements behind them),
-        # then LLM cases that cover scenarios not already expressed structurally.
-        seen = {tc["description"].lower() for tc in md_cases}
-        deduped_llm = [tc for tc in llm_cases if tc.get("description", "").lower() not in seen]
-        test_cases = md_cases + deduped_llm
+        seen       = {tc["description"].lower() for tc in md_cases}
+        deduped    = [tc for tc in llm_cases if tc.get("description", "").lower() not in seen]
+        test_cases = md_cases + deduped
 
-        # Re-sequence IDs so there are no gaps
         for i, tc in enumerate(test_cases, 1):
             tc["id"] = f"TC{i:03d}"
 
-        print(f"[THINK] Total after merge: {len(test_cases)} test cases.")
+        logger.info("Total after merge: %d test cases.", len(test_cases))
 
         if fields:
             page_text = (page_info or {}).get("page_text", "")
@@ -52,27 +184,27 @@ class Planner:
 
         return test_cases
 
-    # ── Markdown spec parsing ──────────────────────────────────────────────────
+    # ── Markdown spec parser ───────────────────────────────────────────────────
 
-    def parse_markdown_spec(self, spec_text: str) -> dict:
-        """Parse a markdown spec into structured sections, requirements, and BDD scenarios."""
+    def parse_markdown_spec(self, spec_text: str) -> dict[str, Any]:
+        """Parse a markdown spec into sections, requirements, and BDD scenarios."""
         lines = spec_text.splitlines()
 
-        result: dict = {
-            "sections": [],
+        result: dict[str, Any] = {
+            "sections":     [],
             "requirements": [],
-            "scenarios": [],
+            "scenarios":    [],
             "user_stories": [],
         }
 
-        _req_pat    = re.compile(r'^[-*]\s*(R\d+|REQ[-_]?\d+|FR\d+|NFR\d+)[:\s](.+)', re.IGNORECASE)
-        _tc_pat     = re.compile(r'^#{1,4}\s*(TC[-_]?\d+|Test\s+Case\s*\d*)[:\s]?(.*)', re.IGNORECASE)
-        _story_pat  = re.compile(r'\bAs a\b.+\bI want\b', re.IGNORECASE)
-        _given_pat  = re.compile(r'^\*{0,2}Given\*{0,2}[:\s]+(.+)', re.IGNORECASE)
-        _when_pat   = re.compile(r'^\*{0,2}When\*{0,2}[:\s]+(.+)', re.IGNORECASE)
-        _then_pat   = re.compile(r'^\*{0,2}Then\*{0,2}[:\s]+(.+)', re.IGNORECASE)
-        _step_pat   = re.compile(r'(?:Input|Step|Action)[:\s]+(.+?)\s*[=:]\s*(.+)', re.IGNORECASE)
-        _exp_pat    = re.compile(r'Expected[:\s]+(.+)', re.IGNORECASE)
+        _req_pat   = re.compile(r'^[-*]\s*(R\d+|REQ[-_]?\d+|FR\d+|NFR\d+)[:\s](.+)', re.IGNORECASE)
+        _tc_pat    = re.compile(r'^#{1,4}\s*(TC[-_]?\d+|Test\s+Case\s*\d*)[:\s]?(.*)', re.IGNORECASE)
+        _story_pat = re.compile(r'\bAs a\b.+\bI want\b', re.IGNORECASE)
+        _given_pat = re.compile(r'^\*{0,2}Given\*{0,2}[:\s]+(.+)', re.IGNORECASE)
+        _when_pat  = re.compile(r'^\*{0,2}When\*{0,2}[:\s]+(.+)', re.IGNORECASE)
+        _then_pat  = re.compile(r'^\*{0,2}Then\*{0,2}[:\s]+(.+)', re.IGNORECASE)
+        _step_pat  = re.compile(r'(?:Input|Step|Action)[:\s]+(.+?)\s*[=:]\s*(.+)', re.IGNORECASE)
+        _exp_pat   = re.compile(r'Expected[:\s]+(.+)', re.IGNORECASE)
 
         current_section  = None
         current_scenario = None
@@ -82,7 +214,7 @@ class Planner:
             if not s:
                 continue
 
-            if s.startswith('#'):
+            if s.startswith("#"):
                 if current_scenario:
                     result["scenarios"].append(current_scenario)
                     current_scenario = None
@@ -96,7 +228,7 @@ class Planner:
                         "steps": [], "expected": "",
                     }
                 else:
-                    heading = re.sub(r'^#+\s*', '', s)
+                    heading = re.sub(r"^#+\s*", "", s)
                     result["sections"].append({"title": heading, "content": []})
                     current_section = heading
 
@@ -113,8 +245,8 @@ class Planner:
                     current_scenario["then"].append(val)
                     if not current_scenario["expected"]:
                         current_scenario["expected"] = val
-                elif s.startswith(('-', '*', '+')):
-                    item = s.lstrip('-*+ ').strip()
+                elif s.startswith(("-", "*", "+")):
+                    item   = s.lstrip("-*+ ").strip()
                     step_m = _step_pat.match(item)
                     exp_m  = _exp_pat.match(item)
                     if step_m:
@@ -145,9 +277,9 @@ class Planner:
 
         return result
 
-    def build_test_cases_from_parsed_md(self, parsed: dict) -> list:
-        """Convert parsed markdown structure into TC-format dicts."""
-        test_cases = []
+    def build_test_cases_from_parsed_md(self, parsed: dict[str, Any]) -> list[dict[str, Any]]:
+        """Convert parsed markdown into TC-format dicts."""
+        test_cases: list[dict[str, Any]] = []
         idx = 1
 
         for scenario in parsed.get("scenarios", []):
@@ -174,10 +306,9 @@ class Planner:
             idx += 1
 
         for req in parsed.get("requirements", []):
-            desc = f"Verify: {req['text'][:70]}"
             test_cases.append({
                 "id":          f"TC{idx:03d}",
-                "description": desc,
+                "description": f"Verify: {req['text'][:70]}",
                 "steps":       [],
                 "expected":    f"System satisfies {req['id']}: {req['text'][:60]}",
                 "type":        "standard",
@@ -187,24 +318,15 @@ class Planner:
 
         return test_cases
 
-    def _is_valid_login_test(self, tc: dict) -> bool:
-        text = ((tc.get("expected") or "") + " " + (tc.get("description") or "")).lower()
-        has_success = bool(re.search(
-            r'\b(success\w*|correct\w*|valid\b|dashboard|home|redirect\w*|log\w*\s+in|authenticat\w*|grant\w*|welcom\w*)\b',
-            text
-        ))
-        has_failure = bool(re.search(
-            r'\b(fail\w*|error\w*|invalid\w*|incorrect\w*|wrong\w*|empty|reject\w*|deny|denied|block\w*)\b',
-            text
-        ))
-        return has_success and not has_failure
+    # ── Helpers ────────────────────────────────────────────────────────────────
 
-    def _auth_scenario(self, auth_info: dict) -> dict:
+    def _auth_scenario(self, auth_info: dict[str, Any]) -> dict[str, Any]:
+        """Return the canonical auth-flow meta test-case."""
         return {
-            "id": "AUTH_FLOW_001",
-            "type": "auth_flow",
+            "id":          "AUTH_FLOW_001",
+            "type":        "auth_flow",
             "description": "Authentication Flow Test (Register + Login + Invalid Login + Logout)",
-            "auth_info": auth_info,
-            "steps": [],
-            "expected": "User can register, login with valid credentials, and receive error on invalid credentials"
+            "auth_info":   auth_info,
+            "steps":       [],
+            "expected":    "User can register, login with valid credentials, and get error on bad credentials",
         }

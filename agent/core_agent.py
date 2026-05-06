@@ -1,57 +1,76 @@
-import re
-import json
-import os
+"""CoreAgent: orchestrates 4-phase QA test run (Auth → Discover → Deep-test → Report)."""
 import asyncio
+import json
+import logging
+import os
+import re
 import traceback
 from datetime import datetime
 from urllib.parse import urlparse, urljoin
+
+from agent.executor import Executor, run_all_browsers_multi_page, run_all_browsers_parallel
 from agent.observer import Observer
 from agent.planner import Planner
-from agent.executor import run_all_browsers_parallel
 from tools.browser import BrowserWrapper
 from tools.trello import create_failure_card
+from tools.auth import detect_auth_forms
+from config import (
+    TEST_USERNAME, TEST_PASSWORD,
+    MAX_SECTIONS, MAX_TESTS_PER_PAGE, MAX_CRAWL_PAGES,
+    REPORT_DIR,
+)
+
+logger = logging.getLogger(__name__)
 
 
 class CoreAgent:
+    """Top-level QA agent: Auth → Discover → Deep-test → Report."""
 
-    async def _observe(self, url: str, browser_type: str = "chromium"):
-        """Open URL with a temporary browser, return (fields, page_info)."""
-        bw = BrowserWrapper()
-        observer = Observer(bw)
-        try:
-            await bw.start(browser_type)
-            fields, page_info = await observer.observe(url)
-            return fields, page_info
-        finally:
-            await bw.close()
+    # ── Report helpers ──────────────────────────────────────────────────────────
 
-    def _save_and_build_report(self, url: str, browsers: list,
-                                test_cases: list, matrix: dict,
-                                plan_only: bool = False) -> dict:
+    def _save_and_build_report(
+        self,
+        url:        str,
+        browsers:   list[str],
+        test_cases: list[dict],
+        matrix:     dict,
+        plan_only:  bool = False,
+    ) -> dict:
         """Build the standard response dict, persist to JSON, return it."""
+        # Deduplication guard — log a warning if the same test ID appears twice
+        seen: set[str] = set()
+        dupes: list[str] = []
+        for tid in matrix:
+            if tid in seen:
+                dupes.append(tid)
+            seen.add(tid)
+        if dupes:
+            logger.warning("Duplicate test IDs in matrix: %s", dupes)
+
         total   = len(matrix)
         passed  = sum(1 for d in matrix.values() if d.get("overall") == "PASSED")
         failed  = sum(1 for d in matrix.values() if d.get("overall") == "FAILED")
         partial = sum(1 for d in matrix.values() if d.get("overall") == "PARTIAL")
 
         report = {
-            "timestamp":    datetime.now().isoformat(),
-            "url":          url,
-            "browsers":     browsers,
+            "timestamp":     datetime.now().isoformat(),
+            "url":           url,
+            "browsers":      browsers,
             "multi_browser": len(browsers) > 1,
-            "plan_only":    plan_only,
-            "total_tests":  total,
-            "passed":       passed,
-            "failed":       failed,
-            "partial":      partial,
-            "results":      matrix,
+            "plan_only":     plan_only,
+            "total_tests":   total,
+            "passed":        passed,
+            "failed":        failed,
+            "partial":       partial,
+            "results":       matrix,
         }
 
-        os.makedirs("output", exist_ok=True)
-        path = f"output/report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(report, f, indent=2, ensure_ascii=False)
+        os.makedirs(REPORT_DIR, exist_ok=True)
+        path = os.path.join(REPORT_DIR, f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(report, fh, indent=2, ensure_ascii=False)
 
+        logger.info("Report saved → %s", path)
         print(f"[REPORT] Saved to {path}")
         print(f"[REPORT] Total: {total} | Passed: {passed} | Failed: {failed} | Partial: {partial}")
 
@@ -62,12 +81,16 @@ class CoreAgent:
                     b for b, bd in data.get("browsers", {}).items()
                     if bd.get("status") not in ("PASSED", "SKIPPED")
                 ]
-                error_str  = " | ".join(
-                    f"{b}: {data['browsers'][b].get('error','failed')}" for b in failed_browsers
+                error_str = " | ".join(
+                    f"{b}: {data['browsers'][b].get('error', 'failed')}"
+                    for b in failed_browsers
                 )
                 screenshot = next(
-                    (data["browsers"][b].get("screenshot") for b in browsers
-                     if b in data.get("browsers", {}) and data["browsers"][b].get("screenshot")),
+                    (
+                        data["browsers"][b].get("screenshot")
+                        for b in browsers
+                        if b in data.get("browsers", {}) and data["browsers"][b].get("screenshot")
+                    ),
                     None,
                 )
                 create_failure_card(
@@ -80,330 +103,798 @@ class CoreAgent:
         report["report_file"] = os.path.basename(path)
         return report
 
-    # ── Credential helpers ─────────────────────────────────────────────────────
+    # ── Credential helpers ──────────────────────────────────────────────────────
 
     @staticmethod
-    def _find_valid_credentials(test_cases: list) -> dict | None:
-        """Extract login credentials from the test case marked as valid login."""
+    def _find_credentials_from_steps(test_cases: list[dict]) -> dict | None:
+        """Extract valid login credentials from the 'valid login' test case steps."""
         for tc in test_cases:
             expected = (tc.get("expected") or "").lower()
-            if (re.search(r'\b(success|redirect|dashboard|inventory|home|welcome|logged)\b', expected)
-                    and not re.search(r'\b(fail|error|invalid|wrong)\b', expected)):
-                creds = {}
-                for step in tc.get("steps", []):
-                    field = (step.get("field") or "").lower()
-                    value = (step.get("value") or "").strip()
-                    if not value:
-                        continue
-                    if any(k in field for k in ("user", "email", "login", "name")):
-                        creds["username"] = value
-                    elif "pass" in field:
-                        creds["password"] = value
-                if creds.get("username") and creds.get("password"):
-                    return creds
+            if not re.search(r"\b(success|redirect|dashboard|inventory|home|welcome|logged)\b", expected):
+                continue
+            if re.search(r"\b(fail|error|invalid|wrong)\b", expected):
+                continue
+            creds: dict[str, str] = {}
+            for step in tc.get("steps", []):
+                if step.get("action") not in (None, "fill"):
+                    continue
+                field = (step.get("field") or "").lower()
+                value = (step.get("value") or "").strip()
+                if not value:
+                    continue
+                if any(k in field for k in ("user", "email", "login", "name")):
+                    creds["username"] = value
+                elif "pass" in field:
+                    creds["password"] = value
+            if creds.get("username") and creds.get("password"):
+                return creds
         return None
 
     @staticmethod
     def _extract_credentials_from_page(page_text: str) -> dict | None:
         """Regex fallback: find visible demo credentials in page text."""
-        text = page_text
+        _bad = {"password", "pass", "pwd", "login", "email", "enter",
+                "your", "the", "a", "username", "user", "name"}
         username = None
         password = None
 
-        _bad_words = {"password", "pass", "pwd", "login", "email", "enter",
-                      "your", "the", "a", "username", "user", "name"}
-
-        # Ordered from most specific to least — stops on first valid hit
-        username_patterns = [
-            r'accepted usernames?(?:\s+are)?[:\s]+([a-zA-Z0-9_.\-]+)',
-            r'(?:demo|sample|test|example|default)\s+(?:username|user|login)[:\s]+([a-zA-Z0-9_.\-]+)',
-            r'(?:username|user|login):\s*([a-zA-Z0-9_.\-]{3,30})',
-        ]
-        for pat in username_patterns:
-            m = re.search(pat, text, re.IGNORECASE)
+        for pat in (
+            r"accepted usernames?(?:\s+are)?[:\s]+([a-zA-Z0-9_.\-]+)",
+            r"(?:demo|sample|test|example|default)\s+(?:username|user|login)[:\s]+([a-zA-Z0-9_.\-]+)",
+            r"(?:username|user|login):\s*([a-zA-Z0-9_.\-]{3,30})",
+        ):
+            m = re.search(pat, page_text, re.IGNORECASE)
             if m:
-                candidate = m.group(1).strip()
-                if candidate.lower() not in _bad_words and len(candidate) >= 3:
-                    username = candidate
+                c = m.group(1).strip()
+                if c.lower() not in _bad and len(c) >= 3:
+                    username = c
                     break
 
-        password_patterns = [
-            r'password\s+for\s+(?:all\s+)?users?[:\s]+([a-zA-Z0-9_@!#$%^&*()\-]{4,})',
-            r'(?:password|pass|pwd):\s*([a-zA-Z0-9_@!#$%^&*()\-]{4,})',
-        ]
-        for pat in password_patterns:
-            m = re.search(pat, text, re.IGNORECASE)
+        for pat in (
+            r"password\s+for\s+(?:all\s+)?users?[:\s]+([a-zA-Z0-9_@!#$%^&*()\-]{4,})",
+            r"(?:password|pass|pwd):\s*([a-zA-Z0-9_@!#$%^&*()\-]{4,})",
+        ):
+            m = re.search(pat, page_text, re.IGNORECASE)
             if m:
-                candidate = m.group(1).strip()
-                if candidate.lower() not in _bad_words and len(candidate) >= 4:
-                    password = candidate
+                c = m.group(1).strip()
+                if c.lower() not in _bad and len(c) >= 4:
+                    password = c
                     break
 
         if username and password:
+            logger.info("Page credentials found: username=%r", username)
             print(f"[EXTRACT] Page credentials found: username='{username}', password='{password}'")
             return {"username": username, "password": password}
         return None
 
-    # ── Platform exploration ───────────────────────────────────────────────────
+    async def _try_default_credentials(
+        self,
+        url: str,
+        browser_type: str,
+    ) -> dict | None:
+        """Try a curated list of common default credentials against the login form.
 
-    async def _explore_platform(self, url: str, browser_type: str,
-                                 credentials: dict, emit_fn=None) -> dict:
+        Used as last resort when a platform has no self-registration and shows
+        no demo credentials on the page (e.g. OrangeHRM, WordPress, Jira, etc.).
+        Tries each pair and checks whether the URL changes after submit.
         """
-        Login with known credentials, then crawl all internal navigation links.
-        For each discovered page: screenshot + check errors + test any forms found.
-        """
-        from tools.llm import generate_test_cases as llm_gen
-        from agent.executor import Executor
+        _DEFAULTS = [
+            ("Admin",     "admin123"),
+            ("admin",     "admin"),
+            ("admin",     "admin123"),
+            ("admin",     "Admin123"),
+            ("admin",     "password"),
+            ("admin",     "Password1"),
+            ("admin",     "Admin@123"),
+            ("admin",     "1234"),
+            ("admin",     "12345678"),
+            ("user",      "user"),
+            ("user",      "password"),
+            ("test",      "test"),
+            ("demo",      "demo"),
+            ("root",      "root"),
+            ("admin@admin.com", "admin"),
+            ("admin@admin.com", "admin123"),
+        ]
 
-        base_domain = urlparse(url).netloc.removeprefix("www.")
+        logger.info("Trying common default credentials against %s…", url)
         bw = BrowserWrapper()
-        matrix: dict = {}
-
         try:
             await bw.start(browser_type)
+            orig_path = urlparse(url).path.rstrip("/") or "/"
 
-            # ── Step 1: Login ──────────────────────────────────────────────────
-            print(f"[EXPLORE] Logging in to {url} as '{credentials['username']}'")
-            await bw.open_page(url)
-            fields = await bw.extract_inputs()
-
-            for field in fields:
-                fid   = (field.get("id") or field.get("name") or "").lower()
-                ftype = (field.get("type") or "").lower()
-                ident = field.get("id") or field.get("name") or ftype
-                if any(k in fid for k in ("user", "email", "login", "name")) or ftype == "text":
-                    await bw.fill_field(ident, credentials["username"])
-                elif ftype == "password":
-                    await bw.fill_field(ident, credentials["password"])
-
-            await bw.click_submit()
-            try:
-                await bw.page.wait_for_load_state("networkidle", timeout=8000)
-            except Exception:
-                pass
-            await asyncio.sleep(2)
-
-            post_login_url = await bw.get_page_url()
-            origin_path = urlparse(url).path.rstrip("/") or "/"
-            post_path   = urlparse(post_login_url).path.rstrip("/") or "/"
-            print(f"[EXPLORE] Post-login URL: {post_login_url} (path: {post_path})")
-            if post_path == origin_path:
-                print("[EXPLORE] Login failed — URL did not change. Credentials may be wrong.")
-                return {}
-
-            print(f"[EXPLORE] Login successful — now at {post_login_url}")
-            if emit_fn:
-                emit_fn({"log": f"[EXPLORE] Login successful — exploring platform interior..."})
-
-            # ── Step 2: Discover nav links ─────────────────────────────────────
-            raw_links: list = await bw.page.evaluate("""
-                () => {
-                    const sel = 'a[href], nav a, .nav a, .menu a, header a, [role="navigation"] a, .sidebar a';
-                    return [...new Set([...document.querySelectorAll(sel)].map(a => a.href))]
-                        .filter(h => h && !h.startsWith('javascript:') && !h.includes('#')
-                                   && !h.match(/\\.(pdf|zip|jpg|png|gif|svg|css|js)$/i));
-                }
-            """)
-
-            internal_links = [
-                l for l in raw_links
-                if urlparse(l).netloc.removeprefix("www.") == base_domain and l != post_login_url
-            ]
-            # Deduplicate and cap at 10 pages
-            seen = set()
-            unique_links = []
-            for l in internal_links:
-                norm = urlparse(l)._replace(fragment="", query="").geturl()
-                if norm not in seen:
-                    seen.add(norm)
-                    unique_links.append(l)
-            unique_links = unique_links[:10]
-
-            print(f"[EXPLORE] Raw links found: {len(raw_links)}, internal unique: {len(unique_links)}")
-            for lnk in unique_links:
-                print(f"[EXPLORE]   -> {lnk}")
-
-            # ── Step 3: Visit each page ────────────────────────────────────────
-            executor = Executor(bw)
-
-            for i, page_url in enumerate(unique_links, start=1):
-                tc_id = f"EXPLORE_{i:03d}"
-                path_label = urlparse(page_url).path.rstrip("/") or "/"
-                print(f"[EXPLORE] ({i}/{len(unique_links)}) {page_url}")
-                if emit_fn:
-                    emit_fn({"log": f"[EXPLORE] Visiting {path_label}"})
-
-                entry = {
-                    "title":       path_label,
-                    "description": f"Page exploration: {path_label}",
-                    "expected":    "Page loads without errors",
-                    "steps":       [],
-                    "type":        "exploration",
-                    "browsers":    {},
-                    "overall":     "PASSED",
-                }
-
+            for username, password in _DEFAULTS:
                 try:
-                    await bw.open_page(page_url)
-                    await bw.wait_for_load()
-
-                    has_error  = await bw.has_error_message()
-                    screenshot = await bw.take_screenshot(f"explore_{tc_id}")
-                    page_text  = await bw.get_page_text()
-                    status     = "FAILED" if has_error else "PASSED"
-
-                    entry["browsers"][browser_type] = {
-                        "status":     status,
-                        "error":      "Error message detected on page" if has_error else "",
-                        "screenshot": screenshot,
-                    }
-                    entry["overall"] = status
-
-                    # If forms found on this page, generate + run quick tests
-                    page_fields = await bw.extract_inputs()
-                    if page_fields:
-                        print(f"[EXPLORE] Found {len(page_fields)} form field(s) on {path_label} — running quick tests")
-                        if emit_fn:
-                            emit_fn({"log": f"[EXPLORE] Testing form on {path_label}..."})
-                        try:
-                            sub_cases = llm_gen(page_fields, page_url, page_text=page_text[:400])
-                            for j, tc in enumerate(sub_cases[:4], start=1):
-                                sub_id = f"EXPLORE_{i:03d}_F{j:02d}"
-                                tc["id"] = sub_id
-                                res = await executor.execute(tc, page_url)
-                                sub_status = (res.get("status") or "unknown").upper()
-                                matrix[sub_id] = {
-                                    "title":       tc.get("description", ""),
-                                    "description": tc.get("description", ""),
-                                    "expected":    tc.get("expected", ""),
-                                    "steps":       tc.get("steps", []),
-                                    "type":        "exploration_form",
-                                    "browsers":    {browser_type: {
-                                        "status":     sub_status,
-                                        "error":      res.get("error") or "",
-                                        "screenshot": res.get("screenshot") or "",
-                                    }},
-                                    "overall": sub_status,
-                                }
-                                if emit_fn:
-                                    emit_fn({"test_id": sub_id, "browser": browser_type,
-                                             "status": sub_status})
-                        except Exception as e:
-                            print(f"[EXPLORE] Form test generation failed on {path_label}: {e}")
-
-                except Exception as e:
-                    print(f"[EXPLORE] Failed to visit {page_url}: {e}")
-                    entry["browsers"][browser_type] = {
-                        "status": "FAILED", "error": str(e), "screenshot": None,
-                    }
-                    entry["overall"] = "FAILED"
-
-                matrix[tc_id] = entry
-                if emit_fn:
-                    emit_fn({"test_id": tc_id, "browser": browser_type,
-                             "status": entry["overall"]})
-
+                    await bw.open_page(url)
+                    fields = await bw.extract_inputs()
+                    filled = 0
+                    for field in fields:
+                        fid   = (field.get("id") or field.get("name") or "").lower()
+                        ftype = (field.get("type") or "").lower()
+                        ident = field.get("id") or field.get("name") or ftype
+                        if any(k in fid for k in ("user", "email", "login", "name")) or ftype in ("text", "email"):
+                            await bw.fill_field(ident, username)
+                            filled += 1
+                        elif ftype == "password":
+                            await bw.fill_field(ident, password)
+                            filled += 1
+                    if filled < 2:
+                        break  # no usable login form found — stop trying
+                    await bw.click_submit()
+                    try:
+                        await bw.page.wait_for_load_state("networkidle", timeout=5000)
+                    except Exception:
+                        pass
+                    post_path = urlparse(await bw.get_page_url()).path.rstrip("/") or "/"
+                    if post_path != orig_path:
+                        logger.info("Default credentials worked: username=%r", username)
+                        print(f"[PHASE 1] Default credentials found: {username}")
+                        return {"username": username, "password": password}
+                except Exception:
+                    continue
         except Exception as e:
-            traceback.print_exc()
-            print(f"[EXPLORE] Exploration engine error: {e}")
+            logger.warning("Default credential probe failed: %s", e)
+        finally:
+            await bw.close()
+        return None
+
+    # ── PHASE 1 — Auth ──────────────────────────────────────────────────────────
+
+    async def _phase_auth(
+        self,
+        url:      str,
+        browsers: list[str],
+        emit_fn,
+    ) -> tuple[dict, dict | None]:
+        """Test the auth page; return (auth_matrix, verified_credentials)."""
+        print(f"[PHASE 1] Auth — observing {url}")
+        if emit_fn:
+            emit_fn({"log": "[PHASE 1] Authentification — analyse de la page..."})
+
+        bw       = BrowserWrapper()
+        observer = Observer(bw)
+        planner  = Planner()
+
+        try:
+            await bw.start(browsers[0])
+            elements, page_info = await observer.observe(url)
+            page_text = page_info.get("page_text", "")
+        except Exception as exc:
+            logger.error("Phase 1 observe failed: %s", exc)
+            await bw.close()
+            return {}, None
         finally:
             await bw.close()
 
-        print(f"[EXPLORE] Done — {len(matrix)} exploration result(s) added to report.")
+        # Check if ENV credentials are set — use them directly
+        env_creds: dict | None = None
+        if TEST_USERNAME and TEST_PASSWORD:
+            env_creds = {"username": TEST_USERNAME, "password": TEST_PASSWORD}
+            logger.info("Using TEST_USERNAME / TEST_PASSWORD from environment.")
+            print(f"[PHASE 1] Using env credentials: username='{TEST_USERNAME}'")
+
+        # Detect auth forms
+        fields    = [e for e in elements if e.get("category") == "form_field"]
+        auth_info = detect_auth_forms(fields, url, page_text)
+        is_auth   = auth_info["has_login"] or auth_info["has_register"]
+
+        if not is_auth:
+            # No login/register page — skip auth testing entirely.
+            # The rest of the app will be tested in Phase 3 via nav discovery.
+            logger.info("No auth form detected — skipping auth phase.")
+            if emit_fn:
+                emit_fn({"log": "[PHASE 1] Aucun formulaire d'authentification — phase ignorée."})
+            page_creds = self._extract_credentials_from_page(page_text)
+            return {}, env_creds or page_creds
+
+        # Auth page confirmed — generate and run auth test cases
+        test_cases = planner.plan(elements, url, page_info)
+
+        print(f"[PHASE 1] {len(test_cases)} auth test cases generated.")
+        if emit_fn:
+            emit_fn({"log": f"[PHASE 1] {len(test_cases)} tests d'authentification générés."})
+
+        # Execute on all browsers
+        auth_matrix = await run_all_browsers_parallel(test_cases, url, browsers, emit_fn)
+
+        # Determine verified credentials — priority order:
+        # 1. Env vars  2. Credentials the auth flow actually registered/used
+        #              3. Visible demo credentials on the page
+        #              4. Hardcoded values in the "valid login" test case steps
+        credentials = env_creds
+
+        if not credentials:
+            # Auth flow (AUTH_FLOW_001) stores credentials_used in the matrix entry.
+            # Only use these if the platform HAS a registration form — otherwise the
+            # mock email was never registered and will always fail on login.
+            if auth_info.get("has_register"):
+                auth_entry = auth_matrix.get("AUTH_FLOW_001", {})
+                used = auth_entry.get("credentials_used")
+                if used:
+                    username = used.get("email") or used.get("username") or ""
+                    password = used.get("password") or ""
+                    if username and password:
+                        credentials = {"username": username, "password": password}
+                        logger.info("Using credentials from auth flow registration: %s", username)
+
+        if not credentials:
+            credentials = self._extract_credentials_from_page(page_text)
+
+        if not credentials:
+            credentials = self._find_credentials_from_steps(test_cases)
+
+        if not credentials and auth_info.get("has_login") and not auth_info.get("has_register"):
+            # No registration form and no credentials found anywhere —
+            # try common default credentials (e.g. OrangeHRM: Admin/admin123)
+            if emit_fn:
+                emit_fn({"log": "[PHASE 1] Tentative de connexion avec identifiants par défaut…"})
+            credentials = await self._try_default_credentials(url, browsers[0])
+
+        if credentials:
+            logger.info("Credentials resolved: username=%r", credentials.get("username"))
+        else:
+            logger.info("No credentials found — Phase 2 will discover public nav only.")
+
+        return auth_matrix, credentials
+
+    # ── PHASE 2 — Discovery ─────────────────────────────────────────────────────
+
+    async def _phase_discover(
+        self,
+        url:         str,
+        credentials: dict | None,
+        browser_type: str,
+        emit_fn,
+    ) -> list[dict]:
+        """Login if credentials are available, then extract all nav/sidebar links.
+
+        Works for both authenticated apps (logs in first) and public apps (navigates
+        directly). Returns list of {text, href, norm}.
+        """
+        if credentials:
+            print(f"[PHASE 2] Discovery — logging in as '{credentials['username']}'")
+            if emit_fn:
+                emit_fn({"log": f"[PHASE 2] Découverte — connexion en tant que '{credentials['username']}'"})
+        else:
+            logger.info("No credentials — discovering nav links without authentication.")
+            if emit_fn:
+                emit_fn({"log": "[PHASE 2] Découverte sans authentification..."})
+
+        bw = BrowserWrapper()
+        try:
+            await bw.start(browser_type)
+            await bw.open_page(url)
+
+            if credentials:
+                # Fill login form and submit
+                fields = await bw.extract_inputs()
+                for field in fields:
+                    fid   = (field.get("id") or field.get("name") or "").lower()
+                    ftype = (field.get("type") or "").lower()
+                    ident = field.get("id") or field.get("name") or ftype
+                    if any(k in fid for k in ("user", "email", "login", "name")) or ftype in ("text", "email"):
+                        await bw.fill_field(ident, credentials["username"])
+                    elif ftype == "password":
+                        await bw.fill_field(ident, credentials["password"])
+
+                await bw.click_submit()
+                try:
+                    await bw.page.wait_for_load_state("networkidle", timeout=8000)
+                except Exception:
+                    pass
+                await asyncio.sleep(2)
+
+                post_url  = await bw.get_page_url()
+                post_path = urlparse(post_url).path.rstrip("/") or "/"
+                orig_path = urlparse(url).path.rstrip("/") or "/"
+
+                if post_path == orig_path:
+                    logger.warning("Login may have failed — URL did not change after submit.")
+                    print("[PHASE 2] Login may have failed — URL unchanged.")
+                    # Still attempt nav discovery from the current page rather than aborting
+                else:
+                    print(f"[PHASE 2] Logged in — now at {post_url}")
+                    if emit_fn:
+                        emit_fn({"log": f"[PHASE 2] Connecté — exploration depuis {post_url}"})
+
+            # Screenshot dashboard
+            await bw.take_screenshot("phase2_dashboard")
+
+            # Extract all nav/sidebar/menu links
+            base_domain = urlparse(url).netloc.removeprefix("www.")
+            raw_links: list[str] = await bw.page.evaluate("""
+                () => {
+                    const sel = 'nav a, .sidebar a, aside a, [role="navigation"] a, '
+                              + '[class*="menu"] a, header a, [class*="nav"] a';
+                    return [...new Set([...document.querySelectorAll(sel)].map(a => a.href))]
+                        .filter(h => h && !h.startsWith('javascript:') && !h.includes('#')
+                               && !h.match(/\\.(pdf|zip|jpg|png|gif|svg|css|js)$/i));
+                }
+            """)
+
+            _SKIP_KWS = ("logout", "signout", "sign-out", "log-out")
+            sections: list[dict] = []
+            seen_paths: set[str] = set()
+            for link in raw_links:
+                parsed = urlparse(link)
+                if parsed.netloc.removeprefix("www.") != base_domain:
+                    continue
+                norm = parsed._replace(fragment="", query="").geturl()
+                if norm in seen_paths:
+                    continue
+                if any(kw in link.lower() for kw in _SKIP_KWS):
+                    continue
+                seen_paths.add(norm)
+                # Get link text
+                try:
+                    text = await bw.page.eval_on_selector(
+                        f"[href='{link}'], a[href='{parsed.path}']",
+                        "el => (el.innerText || el.textContent || '').trim()",
+                    )
+                except Exception:
+                    text = parsed.path
+
+                sections.append({"text": text or parsed.path, "href": link, "norm": norm})
+
+            sections = sections[:MAX_SECTIONS]
+            print(f"[PHASE 2] Discovered {len(sections)} sections: {[s['text'] for s in sections]}")
+            if emit_fn:
+                emit_fn({"log": f"[PHASE 2] {len(sections)} sections découvertes."})
+            return sections
+
+        except Exception as exc:
+            traceback.print_exc()
+            logger.error("Phase 2 discovery failed: %s", exc)
+            return []
+        finally:
+            await bw.close()
+
+    # ── PHASE 3 — Deep testing ──────────────────────────────────────────────────
+
+    async def _phase_deep_test(
+        self,
+        url:         str,
+        sections:    list[dict],
+        credentials: dict | None,
+        browsers:    list[str],
+        emit_fn,
+    ) -> dict:
+        """Visit every discovered section, generate and run tests. Returns results matrix."""
+        from tools.llm import generate_quick_test_cases
+
+        matrix: dict = {}
+        base_domain = urlparse(url).netloc.removeprefix("www.")
+
+        print(f"[PHASE 3] Deep testing — {len(sections)} sections × {len(browsers)} browser(s)")
+        if emit_fn:
+            emit_fn({"log": f"[PHASE 3] Tests approfondis — {len(sections)} sections..."})
+
+        for i, section in enumerate(sections, 1):
+            section_url  = section["href"]
+            section_name = section["text"][:30]
+            section_id   = f"SEC{i:03d}"
+
+            print(f"[PHASE 3] ({i}/{len(sections)}) {section_name} → {section_url}")
+            if emit_fn:
+                emit_fn({"log": f"[PHASE 3] Section {i}/{len(sections)}: {section_name}"})
+
+            # ── Navigate & observe (single browser, fast) ──────────────────
+            bw       = BrowserWrapper()
+            observer = Observer(bw)
+            planner  = Planner()
+
+            page_elements: list[dict] = []
+            page_info:     dict       = {}
+            section_ok                = True
+
+            try:
+                await bw.start(browsers[0])
+
+                # Login first if credentials available
+                if credentials:
+                    try:
+                        await bw.open_page(url)
+                        fields = await bw.extract_inputs()
+                        for field in fields:
+                            fid   = (field.get("id") or field.get("name") or "").lower()
+                            ftype = (field.get("type") or "").lower()
+                            ident = field.get("id") or field.get("name") or ftype
+                            if any(k in fid for k in ("user", "email", "login", "name")) or ftype in ("text", "email"):
+                                await bw.fill_field(ident, credentials["username"])
+                            elif ftype == "password":
+                                await bw.fill_field(ident, credentials["password"])
+                        await bw.click_submit()
+                        try:
+                            await bw.page.wait_for_load_state("networkidle", timeout=6000)
+                        except Exception:
+                            pass
+                        await asyncio.sleep(1)
+                    except Exception as login_exc:
+                        logger.warning("Phase 3 login failed for %s: %s — observing without auth.",
+                                       section_name, login_exc)
+
+                # Navigate to section
+                page_elements, page_info = await observer.observe(section_url)
+
+            except Exception as exc:
+                logger.error("Phase 3 observe failed for %s: %s", section_url, exc)
+                print(f"[PHASE 3] Error observing {section_name}: {exc}")
+                section_ok = False
+            finally:
+                await bw.close()
+
+            # Record page-load test
+            load_tc_id = f"{section_id}_LOAD"
+            matrix[load_tc_id] = {
+                "title":       f"Chargement: {section_name}",
+                "description": f"Chargement: {section_name}",
+                "expected":    "Page sans erreur",
+                "steps":       [],
+                "type":        "crawl",
+                "browsers":    {browsers[0]: {
+                    "status":     "PASSED" if section_ok else "FAILED",
+                    "error":      "" if section_ok else "Could not observe page",
+                    "screenshot": "",
+                }},
+                "overall": "PASSED" if section_ok else "FAILED",
+            }
+            if emit_fn:
+                emit_fn({"test_id": load_tc_id, "browser": browsers[0],
+                          "status": matrix[load_tc_id]["overall"]})
+
+            if not section_ok:
+                continue
+
+            # Generate tests if page has interactive elements
+            fields      = [e for e in page_elements if e.get("category") == "form_field"]
+            page_ctx    = planner.detect_page_context(page_elements)
+            has_actions = any(e.get("category") == "action" for e in page_elements)
+            has_table   = any(e.get("category") == "data_display" for e in page_elements)
+
+            if not (fields or has_actions or has_table):
+                logger.debug("No interactive elements on %s — skipping test generation.", section_name)
+                continue
+
+            print(f"[PHASE 3] Generating tests for '{section_name}' (context={page_ctx})")
+            if emit_fn:
+                emit_fn({"log": f"[PHASE 3] Génération tests: {section_name} ({page_ctx})"})
+
+            try:
+                test_cases = await asyncio.to_thread(
+                    planner.plan, page_elements, section_url, page_info
+                )
+            except Exception as exc:
+                logger.error("Test generation failed for %s: %s", section_name, exc)
+                print(f"[PHASE 3] Test gen failed for {section_name}: {exc}")
+                continue
+
+            # Assign unique IDs prefixed with section ID
+            url_tc_pairs: list[tuple[str, dict]] = []
+            seen_tc_ids: set[str] = set()
+            for j, tc in enumerate(test_cases[:MAX_TESTS_PER_PAGE], 1):
+                raw_id  = tc.get("id", f"T{j:03d}")
+                safe_id = f"{section_id}_{raw_id}"
+                # Guard against duplicate IDs within this section
+                if safe_id in seen_tc_ids:
+                    safe_id = f"{safe_id}_{j}"
+                seen_tc_ids.add(safe_id)
+                tc["id"]         = safe_id
+                tc["target_url"] = section_url
+                url_tc_pairs.append((section_url, tc))
+
+            # Execute on all browsers
+            section_matrix = await run_all_browsers_multi_page(
+                url_tc_pairs, browsers, emit_fn
+            )
+
+            # Merge — check for matrix-level collisions
+            for tid, data in section_matrix.items():
+                if tid in matrix:
+                    logger.warning("Test ID collision across sections: %s — appending suffix", tid)
+                    tid = f"{tid}_dup{i}"
+                matrix[tid] = data
+
+        print(f"[PHASE 3] Done — {len(matrix)} results collected.")
         return matrix
 
-    # ── Public API ─────────────────────────────────────────────────────────────
+    # ── Unauthenticated crawl (no credentials) ──────────────────────────────────
 
-    async def run_multi_browser(self, url: str, browsers: list,
-                                 emit_fn=None) -> dict:
+    async def _crawl_and_test(
+        self,
+        start_url: str,
+        browsers:  list[str],
+        emit_fn,
+    ) -> dict:
+        """BFS crawl for unauthenticated or pre-login pages."""
+        from tools.llm import generate_quick_test_cases
+
+        base_domain = urlparse(start_url).netloc.removeprefix("www.")
+        visited:    set[str]  = set()
+        queue:      list[str] = [start_url]
+        discovered: list      = []
+        found_credentials: dict | None = None
+
+        print(f"[CRAWL] Starting from {start_url}")
+        if emit_fn:
+            emit_fn({"log": f"[CRAWL] Démarrage crawl depuis {start_url}"})
+
+        bw = BrowserWrapper()
+        try:
+            await bw.start(browsers[0])
+
+            while queue and len(discovered) < MAX_CRAWL_PAGES:
+                current = queue.pop(0)
+                norm    = urlparse(current)._replace(fragment="", query="").geturl()
+                if norm in visited:
+                    continue
+                visited.add(norm)
+
+                path = urlparse(current).path or "/"
+                print(f"[CRAWL] ({len(discovered)+1}/{MAX_CRAWL_PAGES}) {path}")
+                if emit_fn:
+                    emit_fn({"log": f"[CRAWL] {path}"})
+
+                page_entry: dict = {
+                    "url": current, "path": path,
+                    "elements": [], "page_text": "",
+                    "has_error": False, "screenshot": None, "error": None,
+                }
+                try:
+                    await bw.open_page(current)
+                    await bw.wait_for_load()
+
+                    raw_links: list[str] = await bw.page.evaluate("""
+                        () => [...new Set([...document.querySelectorAll('a[href]')]
+                            .map(a => a.href)
+                            .filter(h => h && !h.startsWith('javascript:')
+                                   && !h.includes('#')
+                                   && !h.match(/\\.(pdf|zip|jpg|png|gif|svg|css|js)$/i)))]
+                    """)
+                    for link in raw_links:
+                        lnorm = urlparse(link)._replace(fragment="", query="").geturl()
+                        if (
+                            urlparse(link).netloc.removeprefix("www.") == base_domain
+                            and lnorm not in visited
+                            and lnorm not in queue
+                        ):
+                            queue.append(link)
+
+                    # Use observer to get ALL elements
+                    observer    = Observer(bw)
+                    elements, _ = await observer.observe(current)
+                    page_entry["elements"]   = elements
+                    page_entry["page_text"]  = (await bw.get_page_text())
+                    page_entry["has_error"]  = await bw.has_error_message()
+                    page_entry["screenshot"] = await bw.take_screenshot(
+                        f"crawl_p{len(discovered)+1:03d}"
+                    )
+
+                    if not found_credentials:
+                        c = self._extract_credentials_from_page(page_entry["page_text"])
+                        if c:
+                            found_credentials = c
+                            print(f"[CRAWL] Credentials detected on {path}")
+
+                except Exception as exc:
+                    page_entry["has_error"] = True
+                    page_entry["error"]     = str(exc)
+                    logger.warning("Crawl error on %s: %s", current, exc)
+
+                discovered.append(page_entry)
+
+        except Exception as exc:
+            traceback.print_exc()
+            logger.error("Crawl engine error: %s", exc)
+        finally:
+            await bw.close()
+
+        print(f"[CRAWL] Discovered {len(discovered)} pages.")
+
+        # Generate test cases per page
+        url_tc_pairs: list[tuple[str, dict]] = []
+        planner = Planner()
+
+        for i, page in enumerate(discovered, 1):
+            page_id = f"PAGE{i:03d}"
+
+            # Always add a page-load test
+            load_tc: dict = {
+                "id":          page_id,
+                "description": f"Chargement {page['path'][:35]}",
+                "expected":    "Page sans erreur",
+                "steps":       [],
+                "type":        "crawl",
+                "target_url":  page["url"],
+            }
+            url_tc_pairs.append((page["url"], load_tc))
+
+            # Auth type injection
+            fields    = [e for e in page["elements"] if e.get("category") == "form_field"]
+            ctx       = {}
+            auth_info = detect_auth_forms(fields, page["url"], page.get("page_text", ""))
+            if auth_info.get("has_login"):
+                ctx["auth_type"] = "login"
+            elif auth_info.get("has_register"):
+                ctx["auth_type"] = "register"
+
+            # Page context from observer data
+            page_ctx = planner.detect_page_context(page["elements"])
+            if page_ctx != "auth":
+                ctx.update({
+                    "page_type": page_ctx,
+                    "buttons":   [e["text"] for e in page["elements"] if e.get("category") == "action"][:10],
+                    "has_table": any(e.get("category") == "data_display" for e in page["elements"]),
+                    "action_links": [e["text"] for e in page["elements"] if e.get("category") == "action"][:15],
+                })
+
+            has_interactive = (
+                fields
+                or any(e.get("category") == "data_display" for e in page["elements"])
+                or len([e for e in page["elements"] if e.get("category") == "action"]) > 1
+            )
+            if not has_interactive:
+                continue
+
+            print(f"[CRAWL] Generating tests for {page['path']} (context={page_ctx})")
+            if emit_fn:
+                emit_fn({"log": f"[CRAWL] Génération tests: {page['path']}"})
+
+            try:
+                sub_cases = await asyncio.to_thread(
+                    generate_quick_test_cases,
+                    fields, page["url"],
+                    page["page_text"][:300],
+                    ctx,
+                )
+                for j, tc in enumerate(sub_cases, 1):
+                    tc["id"]         = f"{page_id}_T{j:02d}"
+                    tc["target_url"] = page["url"]
+                    url_tc_pairs.append((page["url"], tc))
+            except Exception as exc:
+                logger.error("Test gen failed for %s: %s", page["path"], exc)
+
+        print(f"[CRAWL] Total test cases: {len(url_tc_pairs)}")
+        if emit_fn:
+            emit_fn({"log": f"[CRAWL] {len(url_tc_pairs)} tests — exécution..."})
+
+        matrix = await run_all_browsers_multi_page(url_tc_pairs, browsers, emit_fn)
+        return matrix
+
+    # ── Public API ──────────────────────────────────────────────────────────────
+
+    async def run_multi_browser(
+        self,
+        url:      str,
+        browsers: list[str],
+        emit_fn=None,
+    ) -> dict:
+        """Full 4-phase run: Auth → Discover → Deep-test → Report."""
         if not browsers:
             browsers = ["chromium"]
 
         try:
-            fields, page_info = await self._observe(url, browsers[0])
-        except Exception as e:
+            # ── Phase 1: Auth ──────────────────────────────────────────────────
+            auth_matrix, credentials = await self._phase_auth(url, browsers, emit_fn)
+
+            # ── Phase 2: Discover authenticated sections ───────────────────────
+            sections = await self._phase_discover(url, credentials, browsers[0], emit_fn)
+
+            # ── Phase 3: Deep test each section ───────────────────────────────
+            if sections:
+                deep_matrix = await self._phase_deep_test(
+                    url, sections, credentials, browsers, emit_fn
+                )
+            else:
+                # Fallback: unauthenticated BFS crawl
+                print("[PHASE 3] No sections found — falling back to unauthenticated crawl.")
+                if emit_fn:
+                    emit_fn({"log": "[PHASE 3] Crawl non authentifié (aucune section détectée)."})
+                deep_matrix = await self._crawl_and_test(url, browsers, emit_fn)
+
+            # Merge matrices — auth results first
+            matrix: dict = {}
+            matrix.update(auth_matrix)
+            for tid, data in deep_matrix.items():
+                if tid in matrix:
+                    logger.warning("Matrix merge collision on '%s' — suffixing.", tid)
+                    tid = f"{tid}_DEEP"
+                matrix[tid] = data
+
+        except Exception as exc:
             traceback.print_exc()
-            return {"error": repr(e)}
+            return {"error": repr(exc)}
 
-        if not fields:
-            return {"error": "No input fields found on the page."}
+        return self._save_and_build_report(url, browsers, [], matrix)
 
-        page_text = page_info.get("page_text", "")
-        planner   = Planner()
-        test_cases = planner.plan(fields, url, page_info)
-        print(f"[MULTI] {len(test_cases)} tests × {len(browsers)} browser(s) — running in parallel")
-
-        matrix = await run_all_browsers_parallel(test_cases, url, browsers, emit_fn)
-
-        # Platform exploration: login then crawl interior pages
-        creds_from_page = self._extract_credentials_from_page(page_text)
-        creds_from_cases = self._find_valid_credentials(test_cases)
-        credentials = creds_from_page or creds_from_cases
-        print(f"[EXPLORE] Credential sources — page_regex: {creds_from_page}, test_cases: {creds_from_cases}")
-        if credentials:
-            print(f"[EXPLORE] Using credentials: username='{credentials['username']}' — starting exploration...")
-            explore = await self._explore_platform(url, browsers[0], credentials, emit_fn)
-            matrix.update(explore)
-        else:
-            print("[EXPLORE] No valid credentials detected — skipping interior exploration.")
-
-        return self._save_and_build_report(url, browsers, test_cases, matrix)
-
-    async def run_multi_browser_with_spec(self, url: str, spec_text: str,
-                                           browsers: list, emit_fn=None) -> dict:
+    async def run_multi_browser_with_spec(
+        self,
+        url:       str,
+        spec_text: str,
+        browsers:  list[str],
+        emit_fn=None,
+    ) -> dict:
+        """Spec-driven run: generate plan from spec, then execute if URL provided."""
         if not browsers:
             browsers = ["chromium"]
 
-        has_url  = bool(url and url.strip())
-        fields, page_info = [], {}
+        has_url = bool(url and url.strip())
+        planner = Planner()
 
-        if has_url:
-            try:
-                fields, page_info = await self._observe(url, browsers[0])
-            except Exception as e:
-                traceback.print_exc()
-                return {"error": repr(e)}
-
-        page_text = page_info.get("page_text", "")
-        planner   = Planner()
-        test_cases = planner.plan_from_spec(spec_text, fields, url, page_info)
+        # ── Spec plan ──────────────────────────────────────────────────────────
+        spec_cases  = planner.plan_from_spec(spec_text, [], "", {})
+        spec_matrix = {
+            tc["id"]: {
+                "title":       tc.get("description", ""),
+                "description": tc.get("description", ""),
+                "expected":    tc.get("expected", ""),
+                "steps":       tc.get("steps", []),
+                "type":        tc.get("type", "standard"),
+                "browsers":    {},
+                "overall":     "PLANNED",
+            }
+            for tc in spec_cases
+        }
 
         if not has_url:
-            matrix = {
-                tc["id"]: {
-                    "title":       tc.get("description", ""),
-                    "description": tc.get("description", ""),
-                    "expected":    tc.get("expected", ""),
-                    "steps":       tc.get("steps", []),
-                    "type":        tc.get("type", "standard"),
-                    "browsers":    {},
-                    "overall":     "PLANNED",
-                }
-                for tc in test_cases
-            }
-            return self._save_and_build_report(url or "", browsers, test_cases, matrix, plan_only=True)
+            return self._save_and_build_report("", browsers, spec_cases, spec_matrix, plan_only=True)
 
-        print(f"[MULTI-SPEC] {len(test_cases)} spec tests × {len(browsers)} browser(s)")
-        matrix = await run_all_browsers_parallel(test_cases, url, browsers, emit_fn)
+        # ── Live execution ─────────────────────────────────────────────────────
+        try:
+            bw       = BrowserWrapper()
+            observer = Observer(bw)
+            try:
+                await bw.start(browsers[0])
+                elements, page_info = await observer.observe(url)
+            finally:
+                await bw.close()
+        except Exception as exc:
+            traceback.print_exc()
+            logger.error("Cannot observe %s: %s — spec plan only.", url, exc)
+            return self._save_and_build_report(url, browsers, spec_cases, spec_matrix, plan_only=True)
 
-        # Exploration after spec tests too
-        creds_from_page  = self._extract_credentials_from_page(page_text)
-        creds_from_cases = self._find_valid_credentials(test_cases)
-        credentials = creds_from_page or creds_from_cases
-        print(f"[EXPLORE] Credential sources — page_regex: {creds_from_page}, test_cases: {creds_from_cases}")
-        if credentials and has_url:
-            print(f"[EXPLORE] Credentials found — starting platform exploration...")
-            explore = await self._explore_platform(url, browsers[0], credentials, emit_fn)
-            matrix.update(explore)
+        page_text  = page_info.get("page_text", "")
+        matrix     = dict(spec_matrix)
 
-        return self._save_and_build_report(url, browsers, test_cases, matrix)
+        fields     = [e for e in elements if e.get("category") == "form_field"]
+        if fields:
+            live_cases = planner.plan(elements, url, page_info)
+            for tc in live_cases:
+                if not tc.get("id", "").startswith("AUTH"):
+                    tc["id"] = "LIVE_" + tc.get("id", "X")
+
+            print(f"[SPEC+URL] {len(spec_cases)} spec + {len(live_cases)} live × {len(browsers)} browser(s)")
+            live_matrix = await run_all_browsers_parallel(live_cases, url, browsers, emit_fn)
+            matrix.update(live_matrix)
+
+            creds = (
+                self._extract_credentials_from_page(page_text)
+                or self._find_credentials_from_steps(live_cases)
+            )
+            if creds:
+                sections = await self._phase_discover(url, creds, browsers[0], emit_fn)
+                if sections:
+                    deep = await self._phase_deep_test(url, sections, creds, browsers, emit_fn)
+                    matrix.update(deep)
+        else:
+            print(f"[SPEC+URL] No form fields on {url} — spec plan kept as PLANNED")
+
+        all_cases = spec_cases + (live_cases if fields else [])
+        return self._save_and_build_report(
+            url, browsers, all_cases, matrix, plan_only=not bool(fields)
+        )
 
     # ── Backward-compat single-browser wrappers ────────────────────────────────
 
-    async def run(self, url: str, browser_type: str = "chromium",
-                  emit_fn=None) -> dict:
+    async def run(self, url: str, browser_type: str = "chromium", emit_fn=None) -> dict:
+        """Single-browser convenience wrapper."""
         return await self.run_multi_browser(url, [browser_type], emit_fn)
 
-    async def run_with_spec(self, url: str, spec_text: str,
-                             browser_type: str = "chromium", emit_fn=None) -> dict:
+    async def run_with_spec(
+        self,
+        url:          str,
+        spec_text:    str,
+        browser_type: str = "chromium",
+        emit_fn=None,
+    ) -> dict:
+        """Single-browser spec+URL convenience wrapper."""
         return await self.run_multi_browser_with_spec(url, spec_text, [browser_type], emit_fn)

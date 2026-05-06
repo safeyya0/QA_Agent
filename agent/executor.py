@@ -1,31 +1,60 @@
+"""Test case executor — runs steps against a live browser page."""
 import re
 import asyncio
+import logging
 import traceback
-from urllib.parse import urlparse as _urlparse
+from urllib.parse import urlparse as _urlparse, urljoin as _urljoin
 from tools.browser import BrowserWrapper
 from tools.auth import generate_test_credentials, find_and_click_logout, find_login_link
 
+logger = logging.getLogger(__name__)
+
 
 class Executor:
-    def __init__(self, browser_wrapper):
+    def __init__(self, browser_wrapper: BrowserWrapper) -> None:
         self.browser = browser_wrapper
-        self.verified_credentials = None
+        self.verified_credentials: dict | None = None
+        # Set these to enable session recovery during platform exploration
+        self.explore_credentials: dict | None = None
+        self.explore_login_url:   str  | None = None
+
+    # ── Main entry point ──────────────────────────────────────────────────────
 
     async def execute(self, test_case: dict, url: str) -> dict:
+        """Execute a test case and return a result dict with per-step breakdown.
+
+        Handles all action types: fill, click, navigate, assert_visible,
+        assert_not_visible, screenshot, select, check, fill_form, verify_text,
+        submit, wait, clear, describe.
+
+        Per-step behaviour:
+        - A screenshot is taken after every step (pass or fail).
+        - A failed step marks ``any_step_failed`` but execution continues.
+        - Overall status: FAILED if final verification fails, PARTIAL if some
+          steps failed but verification passed, PASSED otherwise.
+        """
         if test_case.get("type") == "auth_flow":
             return await self.execute_auth_flow(test_case, url)
+        if test_case.get("type") == "crawl":
+            return await self.execute_page_load(test_case, url)
 
-        print(f"[ACT] Executing: {test_case.get('id')} - {test_case.get('description')}")
-        result = {
-            "test_case": test_case,
-            "status": "passed",
-            "error": None,
-            "screenshot": None,
+        tc_id = test_case.get("id", "?")
+        logger.info("Executing %s — %s", tc_id, test_case.get("description"))
+
+        step_results: list[dict] = []
+        result: dict = {
+            "test_case":         test_case,
+            "status":            "passed",
+            "error":             None,
+            "screenshot":        None,
+            "step_results":      step_results,
             "execution_time_ms": 0,
         }
 
-        steps = list(test_case.get("steps", []))
+        steps    = list(test_case.get("steps", []))
         expected = (test_case.get("expected") or "").lower()
+
+        # ── Inject verified credentials for valid-login scenarios ─────────────
         is_valid_login = (
             not re.search(r'\b(fail|error|invalid|incorrect|wrong|reject|empty)\b', expected, re.IGNORECASE)
             and bool(re.search(r'\b(success|log\s+in|dashboard|valid|welcome)\b', expected, re.IGNORECASE))
@@ -35,34 +64,262 @@ class Executor:
             for step in steps:
                 field = (step.get("field") or "").lower()
                 if "email" in field or "user" in field:
-                    step["value"] = creds["email"]
+                    step["value"] = creds.get("username") or creds.get("email") or ""
                 elif "password" in field or "pass" in field:
-                    step["value"] = creds["password"]
-            print(f"[ACT] Injecting verified credentials: {creds['email']}")
+                    step["value"] = creds.get("password") or ""
+            logger.debug("Injecting verified credentials: %s",
+                         creds.get("username") or creds.get("email"))
 
+        # ── Navigate to test URL, recover session if redirected ───────────────
         try:
             await self.browser.open_page(url)
-            for step in steps:
-                await self.browser.fill_field(step.get("field"), step.get("value"))
-            await self.browser.click_submit()
-            await self.browser.wait_for_load()
+            actual_path   = _urlparse(await self.browser.get_page_url()).path.rstrip("/") or "/"
+            expected_path = _urlparse(url).path.rstrip("/") or "/"
+            if actual_path != expected_path:
+                if self.explore_credentials:
+                    await self._re_login(self.explore_login_url or url, self.explore_credentials)
+                else:
+                    try:
+                        await self.browser.context.clear_cookies()
+                        await self.browser.page.evaluate(
+                            "try{localStorage.clear();sessionStorage.clear();}catch(e){}"
+                        )
+                    except Exception:
+                        pass
+                await self.browser.open_page(url)
+        except Exception as nav_err:
+            result["status"] = "failed"
+            result["error"]  = f"Navigation failed: {nav_err}"
+            try:
+                result["screenshot"] = await self.browser.take_screenshot(f"nav_err_{tc_id}")
+            except Exception:
+                pass
+            return result
 
-            print(f"[VERIFY] Verifying: {test_case.get('id')}...")
+        has_fill_step = any(
+            s.get("action") in ("fill", "select") or
+            (s.get("action") is None and s.get("field"))
+            for s in steps
+        )
+        has_explicit_submit = any(
+            s.get("action") in ("submit", "click", "check") for s in steps
+        )
+        any_step_failed = False
+
+        # ── Per-step execution ────────────────────────────────────────────────
+        for i, step in enumerate(steps):
+            action = step.get("action") or ("fill" if step.get("field") else "skip")
+            sr: dict = {
+                "step":       i + 1,
+                "action":     action,
+                "field":      step.get("field") or step.get("text") or step.get("value") or "",
+                "value":      step.get("value") or "",
+                "status":     "passed",
+                "screenshot": None,
+                "error":      None,
+            }
+
+            try:
+                if action == "fill":
+                    field = step.get("field")
+                    value = step.get("value") or ""
+                    if field:
+                        await self.browser.fill_field(field, value)
+
+                elif action == "submit":
+                    await self.browser.click_submit()
+                    await self.browser.wait_for_load()
+
+                elif action == "wait":
+                    try:
+                        secs = min(float(step.get("value", 1)), 5)
+                    except (ValueError, TypeError):
+                        secs = 1
+                    await asyncio.sleep(secs)
+
+                elif action == "navigate":
+                    nav = step.get("value") or url
+                    if nav.startswith("/"):
+                        nav = _urljoin(url, nav)
+                    await self.browser.open_page(nav)
+
+                elif action == "clear":
+                    field = step.get("field")
+                    if field:
+                        await self.browser.fill_field(field, "")
+
+                elif action == "click":
+                    target = step.get("text") or step.get("value") or step.get("field") or ""
+                    if target:
+                        await self.browser.click_element(target)
+                        await self.browser.wait_for_load()
+
+                elif action == "select":
+                    field = step.get("field")
+                    value = step.get("value") or ""
+                    if field and value:
+                        await self.browser.select_option(field, value)
+
+                elif action == "check":
+                    field = step.get("field") or step.get("value") or ""
+                    if field:
+                        await self.browser.check_checkbox(field)
+
+                elif action == "fill_form":
+                    value_hint = step.get("value") or "Test"
+                    await asyncio.sleep(0.5)
+                    filled = await self.browser.fill_all_visible_fields(value_hint)
+                    logger.debug("fill_form: filled %d field(s) on current page.", filled)
+
+                elif action == "verify_text":
+                    text = step.get("value") or step.get("text") or ""
+                    if text:
+                        found = False
+                        for _ in range(6):
+                            found = await self.browser.page_contains_text(text)
+                            if found:
+                                break
+                            await asyncio.sleep(0.5)
+                        if not found:
+                            text_lower = text.lower()
+                            # Keywords that signal the step is checking for an error state
+                            _error_kws = {
+                                "invalid", "error", "fail", "wrong", "incorrect",
+                                "denied", "unauthorized", "rejected", "not found",
+                                "invalid credentials", "erreur", "invalide",
+                            }
+                            # Generic success phrases that warrant a success-message check
+                            _success_kws = {
+                                "successfully", "success", "saved", "created",
+                                "added", "deleted", "updated", "réussi", "enregistré",
+                            }
+                            if any(kw in text_lower for kw in _error_kws):
+                                # LLM wrote e.g. "Invalid credentials" but platform says
+                                # "Epic sadface: ..." — accept any error indicator
+                                found = await self.browser.has_error_message()
+                            elif any(kw in text_lower for kw in _success_kws):
+                                found = await self.browser.has_success_message()
+                            else:
+                                # Platform-specific text (e.g. "Dashboard", "Inventory",
+                                # "Swag Labs") — accept if URL changed after action
+                                # (implies successful redirect) OR success message present
+                                origin_path = _urlparse(url).path.rstrip("/") or "/"
+                                current_path = _urlparse(
+                                    await self.browser.get_page_url()
+                                ).path.rstrip("/") or "/"
+                                found = (
+                                    current_path != origin_path
+                                    or await self.browser.has_success_message()
+                                )
+                        if not found:
+                            raise AssertionError(f"verify_text: '{text}' not found on page.")
+
+                elif action == "assert_visible":
+                    # Accepts a CSS selector or visible text phrase
+                    target = step.get("value") or step.get("text") or step.get("field") or ""
+                    if not target:
+                        raise AssertionError("assert_visible: no target specified.")
+                    visible = False
+                    # Try as CSS selector first
+                    try:
+                        visible = await self.browser.page.locator(target).first.is_visible(timeout=3000)
+                    except Exception:
+                        pass
+                    # Fallback: text search
+                    if not visible:
+                        visible = await self.browser.page_contains_text(target)
+                    if not visible:
+                        raise AssertionError(f"assert_visible: '{target}' not visible on page.")
+
+                elif action == "assert_not_visible":
+                    target = step.get("value") or step.get("text") or step.get("field") or ""
+                    if not target:
+                        raise AssertionError("assert_not_visible: no target specified.")
+                    visible = False
+                    try:
+                        visible = await self.browser.page.locator(target).first.is_visible(timeout=2000)
+                    except Exception:
+                        pass
+                    if not visible:
+                        visible = await self.browser.page_contains_text(target)
+                    if visible:
+                        raise AssertionError(f"assert_not_visible: '{target}' is unexpectedly visible.")
+
+                elif action == "screenshot":
+                    name = step.get("value") or step.get("text") or f"{tc_id}_step{i+1}"
+                    sr["screenshot"] = await self.browser.take_screenshot(name)
+                    # Skip the generic post-step screenshot since we just took one
+                    step_results.append(sr)
+                    await asyncio.sleep(0.2)
+                    continue
+
+                elif action == "describe":
+                    pass  # narrative plan-only step — no live action
+
+                # Screenshot after every executed step
+                try:
+                    sr["screenshot"] = await self.browser.take_screenshot(
+                        f"step_{tc_id}_{i + 1}_{action}"
+                    )
+                except Exception:
+                    pass
+
+            except Exception as step_err:
+                sr["status"] = "failed"
+                sr["error"]  = str(step_err)
+                any_step_failed = True
+                logger.warning("Step %d (%s) failed in %s: %s", i + 1, action, tc_id, step_err)
+                try:
+                    sr["screenshot"] = await self.browser.take_screenshot(
+                        f"step_err_{tc_id}_{i + 1}"
+                    )
+                except Exception:
+                    pass
+                # Continue to next step — do not abort
+
+            step_results.append(sr)
+            await asyncio.sleep(0.2)
+
+        # ── Auto-submit when fill steps exist but no explicit terminal action ─
+        if has_fill_step and not has_explicit_submit:
+            try:
+                await self.browser.click_submit()
+                await self.browser.wait_for_load()
+            except Exception as submit_err:
+                any_step_failed = True
+                logger.warning("Auto-submit failed in %s: %s", tc_id, submit_err)
+
+        # ── Final verification ─────────────────────────────────────────────────
+        verification_passed = False
+        try:
+            logger.debug("Verifying %s…", tc_id)
             current_url = await self.browser.get_page_url()
-            has_error = await self.browser.has_error_message()
+            has_error   = await self.browser.has_error_message()
 
-            is_invalid = bool(re.search(r'\b(fail|error|invalid|incorrect|wrong|reject|empty)\b', expected, re.IGNORECASE))
-            is_valid   = not is_invalid and bool(re.search(r'\b(success|log\s*in|dashboard|valid|redirect|inventory|home|welcome|logged)\b', expected, re.IGNORECASE))
+            _valid_re = re.compile(
+                r'\b(success|succès|log\s*in|dashboard|valid|redirect|inventory|home|welcome|'
+                r'logged|ajout[eé]|supprim[eé]|modifi[eé]|enregistr[eé]|cr[eé][eé]|'
+                r'saved|created|added|deleted|removed|updated|mis à jour|réussi)\b',
+                re.IGNORECASE,
+            )
+            _invalid_re = re.compile(
+                r'\b(fail|error|invalid|incorrect|wrong|reject|empty|'
+                r'erreur|invalide|incorrect|refus[eé]|vide|obligatoire)\b',
+                re.IGNORECASE,
+            )
 
+            is_invalid = bool(_invalid_re.search(expected))
+            is_valid   = not is_invalid and bool(_valid_re.search(expected))
             origin_path = _urlparse(url).path.rstrip("/") or "/"
 
             passed = False
             if is_valid:
-                for _ in range(6):
-                    current_url = await self.browser.get_page_url()
-                    has_error   = await self.browser.has_error_message()
+                for _ in range(8):
+                    current_url  = await self.browser.get_page_url()
+                    has_error    = await self.browser.has_error_message()
+                    has_success  = await self.browser.has_success_message()
                     current_path = _urlparse(current_url).path.rstrip("/") or "/"
-                    if not has_error and current_path != origin_path:
+                    if not has_error and (current_path != origin_path or has_success):
                         passed = True
                         break
                     await asyncio.sleep(0.5)
@@ -70,42 +327,104 @@ class Executor:
                 current_path = _urlparse(current_url).path.rstrip("/") or "/"
                 passed = has_error or current_path == origin_path
             else:
-                passed = True
+                passed = not has_error
 
             if not passed:
-                raise Exception("Verification failed. Expected state not reached.")
+                raise AssertionError("Verification failed. Expected state not reached.")
 
+            verification_passed = True
+
+        except Exception as verify_err:
+            result["error"] = str(verify_err)
+            logger.info("Verification failed for %s: %s", tc_id, verify_err)
+
+        # ── Determine overall status ──────────────────────────────────────────
+        if not verification_passed:
+            result["status"] = "failed"
+        elif any_step_failed:
+            result["status"] = "partial"
+        else:
+            result["status"] = "passed"
+
+        # Final summary screenshot
+        try:
+            label = "error" if not verification_passed else "success"
+            result["screenshot"] = await self.browser.take_screenshot(f"{label}_{tc_id}")
+        except Exception:
+            pass
+
+        return result
+
+    # ── Session recovery ──────────────────────────────────────────────────────
+
+    async def _re_login(self, login_url: str, credentials: dict) -> None:
+        """Re-authenticate when session is lost during platform exploration."""
+        logger.info("Session lost — re-logging in to %s", login_url)
+        try:
+            await self.browser.open_page(login_url)
+            fields = await self.browser.extract_inputs()
+            for field in fields:
+                fid   = (field.get("id") or field.get("name") or "").lower()
+                ftype = (field.get("type") or "").lower()
+                ident = field.get("id") or field.get("name") or ftype
+                if any(k in fid for k in ("user", "email", "login", "name")) or ftype == "text":
+                    await self.browser.fill_field(ident, credentials.get("username", ""))
+                elif ftype == "password":
+                    await self.browser.fill_field(ident, credentials.get("password", ""))
+            await self.browser.click_submit()
+            await self.browser.wait_for_load()
+            logger.info("Re-login complete.")
         except Exception as e:
-            print(f"[ACT/VERIFY] Test {test_case.get('id')} failed: {e}")
+            logger.warning("Re-login failed: %s", e)
+
+    # ── Page load (crawl) ─────────────────────────────────────────────────────
+
+    async def execute_page_load(self, test_case: dict, url: str) -> dict:
+        """Navigate to URL and check for errors — no form interaction."""
+        result: dict = {
+            "test_case":         test_case,
+            "status":            "passed",
+            "error":             None,
+            "screenshot":        None,
+            "step_results":      [],
+            "execution_time_ms": 0,
+        }
+        try:
+            await self.browser.open_page(url)
+            await self.browser.wait_for_load()
+            has_error = await self.browser.has_error_message()
+            result["screenshot"] = await self.browser.take_screenshot(f"crawl_{test_case.get('id')}")
+            if has_error:
+                result["status"] = "failed"
+                result["error"]  = "Error detected on page."
+        except Exception as e:
             result["status"] = "failed"
             result["error"]  = str(e)
             try:
-                result["screenshot"] = await self.browser.take_screenshot(f"error_{test_case.get('id')}")
+                result["screenshot"] = await self.browser.take_screenshot(
+                    f"crawl_err_{test_case.get('id')}"
+                )
             except Exception:
                 pass
-        else:
-            try:
-                result["screenshot"] = await self.browser.take_screenshot(f"success_{test_case.get('id')}")
-            except Exception:
-                pass
-
         return result
 
     # ── Auth flow ─────────────────────────────────────────────────────────────
 
     async def execute_auth_flow(self, test_case: dict, url: str) -> dict:
-        print("[AUTH] Starting Authentication Flow Test")
-        auth_info    = test_case.get("auth_info", {})
-        run_context  = {}
-        steps        = []
+        """Run the full authentication flow: register → login → invalid login → logout."""
+        logger.info("Starting Authentication Flow Test")
+        auth_info   = test_case.get("auth_info", {})
+        run_context: dict = {}
+        steps: list[dict] = []
 
-        result = {
+        result: dict = {
             "test_case":         test_case,
             "status":            "passed",
             "credentials_used":  None,
             "error":             None,
             "screenshot":        None,
             "steps":             steps,
+            "step_results":      steps,
             "execution_time_ms": 0,
         }
 
@@ -116,14 +435,14 @@ class Executor:
         run_context["login_url"]   = auth_info.get("login_url") or url
         run_context["login_verified"] = False
         result["credentials_used"] = credentials
-        print(f"[AUTH] Generated test account: {credentials['email']}")
+        logger.info("Generated test account: %s", credentials["email"])
 
         if auth_info.get("has_register"):
             reg_step = await self._step_register(auth_info, run_context)
             steps.append(reg_step)
 
             if reg_step["status"] == "failed" and "already" in (reg_step.get("note") or "").lower():
-                print("[AUTH] Duplicate email detected, retrying with new credentials...")
+                logger.info("Duplicate email detected, retrying with new credentials…")
                 credentials = generate_test_credentials()
                 if not auth_info.get("has_username_field"):
                     credentials["username"] = None
@@ -155,17 +474,21 @@ class Executor:
             steps.append(await self._step_verify_login(run_context))
         elif auth_info.get("has_register"):
             note = (verify_reg or {}).get("note") or "Registration not confirmed"
-            steps.append({"step": "login",        "status": "skipped", "note": f"Skipped — {note}", "screenshot": None})
-            steps.append({"step": "verify_login", "status": "skipped", "note": f"Skipped — {note}", "screenshot": None})
+            steps.append({"step": "login",        "status": "skipped",
+                           "note": f"Skipped — {note}", "screenshot": None})
+            steps.append({"step": "verify_login", "status": "skipped",
+                           "note": f"Skipped — {note}", "screenshot": None})
         else:
-            steps.append({"step": "login",        "status": "skipped", "note": "No register form.", "screenshot": None})
-            steps.append({"step": "verify_login", "status": "skipped", "note": "No register form.", "screenshot": None})
+            steps.append({"step": "login",        "status": "skipped",
+                           "note": "No register form.", "screenshot": None})
+            steps.append({"step": "verify_login", "status": "skipped",
+                           "note": "No register form.", "screenshot": None})
 
         steps.append(await self._step_invalid_login(run_context))
         steps.append(await self._step_logout(run_context))
 
-        failed_steps   = [s for s in steps if s["status"] == "failed"]
-        critical_fail  = [s for s in failed_steps if s["step"] in ("register", "login", "verify_login")]
+        failed_steps  = [s for s in steps if s["status"] == "failed"]
+        critical_fail = [s for s in failed_steps if s["step"] in ("register", "login", "verify_login")]
 
         if critical_fail:
             result["status"] = "failed"
@@ -180,19 +503,19 @@ class Executor:
 
         if run_context.get("login_verified"):
             self.verified_credentials = run_context["credentials"]
-            print(f"[AUTH] Credentials stored for reuse: {self.verified_credentials['email']}")
+            logger.info("Credentials stored for reuse: %s", self.verified_credentials["email"])
 
-        print(f"[AUTH] Flow complete — status: {result['status']}")
+        logger.info("Auth flow complete — status: %s", result["status"])
         return result
 
     # ── Auth step helpers ─────────────────────────────────────────────────────
 
     async def _step_register(self, auth_info: dict, run_context: dict) -> dict:
         step = {"step": "register", "status": "passed", "note": None, "screenshot": None}
-        credentials   = run_context["credentials"]
-        register_url  = auth_info.get("register_url")
+        credentials  = run_context["credentials"]
+        register_url = auth_info.get("register_url")
         try:
-            print(f"[AUTH][REGISTER] Navigating to {register_url}")
+            logger.info("[REGISTER] Navigating to %s", register_url)
             await self.browser.open_page(register_url)
             fields = await self.browser.extract_inputs()
             for field in fields:
@@ -276,7 +599,7 @@ class Executor:
         step = {"step": "login", "status": "passed", "note": None, "screenshot": None}
         credentials = run_context["credentials"]
         try:
-            print("[AUTH][LOGIN] Filling login form with generated credentials")
+            logger.info("[LOGIN] Filling login form with generated credentials")
             fields = await self.browser.extract_inputs()
             for field in fields:
                 fid   = (field.get("id") or field.get("name") or "").lower()
@@ -309,8 +632,10 @@ class Executor:
             credentials = run_context["credentials"]
             has_error   = await self.browser.has_error_message()
             redirected  = login_url and login_url not in current_url
-            has_content = any(kw in page_text for kw in ["dashboard", "logout", "log out", "sign out", "profile", "welcome", "my account"])
-            email_hint  = credentials["email"].split("@")[0] in page_text
+            has_content = any(kw in page_text for kw in [
+                "dashboard", "logout", "log out", "sign out", "profile", "welcome", "my account",
+            ])
+            email_hint = credentials["email"].split("@")[0] in page_text
             if has_error and not redirected:
                 step["status"] = "failed"
                 step["note"]   = "Login failed: error message detected."
@@ -334,7 +659,7 @@ class Executor:
             if login_url:
                 await self.browser.open_page(login_url)
             wrong_password = credentials["password"] + "wrong"
-            print("[AUTH][INVALID_LOGIN] Testing login with wrong password")
+            logger.info("[INVALID_LOGIN] Testing login with wrong password")
             fields = await self.browser.extract_inputs()
             for field in fields:
                 fid   = (field.get("id") or field.get("name") or "").lower()
@@ -385,7 +710,7 @@ class Executor:
                     await self.browser.fill_field(ident, credentials["password"])
             await self.browser.click_submit()
             await self.browser.wait_for_load()
-            print("[AUTH][LOGOUT] Searching for logout button")
+            logger.info("[LOGOUT] Searching for logout button")
             logout_result = await find_and_click_logout(self.browser.page)
             if logout_result["clicked"]:
                 await self.browser.wait_for_load()
@@ -406,8 +731,12 @@ class Executor:
 
 # ── Module-level multi-browser helpers ────────────────────────────────────────
 
-async def run_on_browser(browser_name: str, test_cases: list, url: str,
-                          emit_fn=None) -> list:
+async def run_on_browser(
+    browser_name: str,
+    test_cases:   list,
+    url:          str,
+    emit_fn=None,
+) -> list:
     """Run all test cases on a single browser instance. Returns list of raw results."""
     bw = BrowserWrapper()
     ex = Executor(bw)
@@ -415,12 +744,19 @@ async def run_on_browser(browser_name: str, test_cases: list, url: str,
         await bw.start(browser_name)
         results = []
         for tc in test_cases:
-            result = await ex.execute(tc, url)
+            try:
+                result = await asyncio.wait_for(ex.execute(tc, url), timeout=45)
+            except asyncio.TimeoutError:
+                logger.warning("Test %s timed out after 45s — marking FAILED.", tc.get("id"))
+                result = {
+                    "test_case": tc, "status": "failed",
+                    "error": "Test timed out after 45s.",
+                    "screenshot": None, "step_results": [],
+                }
             result["id"]      = tc.get("id", "")
             result["title"]   = tc.get("description", "")
             result["browser"] = browser_name
-            # Normalise status to uppercase
-            result["status"] = (result.get("status") or "unknown").upper()
+            result["status"]  = (result.get("status") or "unknown").upper()
             if emit_fn:
                 emit_fn({
                     "test_id": result["id"],
@@ -433,39 +769,45 @@ async def run_on_browser(browser_name: str, test_cases: list, url: str,
         return results
     except Exception as e:
         traceback.print_exc()
-        print(f"[EXECUTOR] Browser '{browser_name}' crashed: {e}")
+        logger.error("Browser '%s' crashed: %s", browser_name, e)
         return []
     finally:
         await bw.close()
 
 
-async def run_all_browsers_parallel(test_cases: list, url: str, browsers: list,
-                                     emit_fn=None) -> dict:
-    """Run all test cases on every browser in parallel. Returns result matrix dict."""
-    tasks = [run_on_browser(b, test_cases, url, emit_fn) for b in browsers]
-    all_results = await asyncio.gather(*tasks)
+def _build_matrix_entry(r: dict) -> dict:
+    """Build the per-test-case matrix structure from a single result."""
+    tc = r.get("test_case") or {}
+    return {
+        "title":       r.get("title") or tc.get("description", ""),
+        "description": tc.get("description", ""),
+        "expected":    tc.get("expected", ""),
+        "steps":       tc.get("steps", []),
+        "type":        tc.get("type", "standard"),
+        "browsers":    {},
+    }
 
-    matrix: dict = {}
-    for browser_results in all_results:
-        for r in browser_results:
-            tid = r.get("id") or "UNKNOWN"
-            if tid not in matrix:
-                tc = r.get("test_case") or {}
-                matrix[tid] = {
-                    "title":       r.get("title") or tc.get("description", ""),
-                    "description": tc.get("description", ""),
-                    "expected":    tc.get("expected", ""),
-                    "steps":       tc.get("steps", []),
-                    "type":        tc.get("type", "standard"),
-                    "browsers":    {},
-                }
-            matrix[tid]["browsers"][r["browser"]] = {
-                "status":     r.get("status", "UNKNOWN"),
-                "error":      r.get("error") or "",
-                "screenshot": r.get("screenshot") or "",
-            }
 
-    for tid, data in matrix.items():
+def _merge_into_matrix(matrix: dict, browser_results: list) -> None:
+    """Merge a list of per-browser results into the shared matrix."""
+    for r in browser_results:
+        tid = r.get("id") or "UNKNOWN"
+        if tid not in matrix:
+            matrix[tid] = _build_matrix_entry(r)
+        matrix[tid]["browsers"][r["browser"]] = {
+            "status":       r.get("status", "UNKNOWN"),
+            "error":        r.get("error") or "",
+            "screenshot":   r.get("screenshot") or "",
+            "step_results": r.get("step_results") or [],
+        }
+        # Preserve credentials_used from auth flow results so Phase 2 can use them
+        if r.get("credentials_used") and not matrix[tid].get("credentials_used"):
+            matrix[tid]["credentials_used"] = r["credentials_used"]
+
+
+def _compute_overall(matrix: dict) -> None:
+    """Set the overall status for each test in the matrix."""
+    for data in matrix.values():
         statuses = [v["status"] for v in data["browsers"].values()]
         if all(s == "PASSED" for s in statuses):
             data["overall"] = "PASSED"
@@ -476,4 +818,75 @@ async def run_all_browsers_parallel(test_cases: list, url: str, browsers: list,
         else:
             data["overall"] = "PARTIAL"
 
+
+async def run_all_browsers_multi_page(
+    url_tc_pairs: list,
+    browsers:     list,
+    emit_fn=None,
+) -> dict:
+    """Run (url, test_case) pairs on every browser in parallel.
+
+    Each browser opens one session and executes all pairs sequentially.
+    Returns a result matrix keyed by test ID.
+    """
+    async def _run_browser(browser_name: str) -> list:
+        bw = BrowserWrapper()
+        ex = Executor(bw)
+        results = []
+        try:
+            await bw.start(browser_name)
+            for target_url, tc in url_tc_pairs:
+                try:
+                    result = await asyncio.wait_for(ex.execute(tc, target_url), timeout=45)
+                except asyncio.TimeoutError:
+                    logger.warning("Test %s timed out after 45s — marking FAILED.", tc.get("id"))
+                    result = {"status": "failed", "error": "Test timed out after 45s.",
+                              "screenshot": None, "step_results": []}
+                except Exception as e:
+                    result = {"status": "failed", "error": str(e),
+                              "screenshot": None, "step_results": []}
+                result.update({
+                    "id":        tc.get("id", ""),
+                    "title":     tc.get("description", ""),
+                    "browser":   browser_name,
+                    "status":    (result.get("status") or "unknown").upper(),
+                    "test_case": tc,
+                })
+                if emit_fn:
+                    emit_fn({
+                        "test_id": result["id"],
+                        "browser": browser_name,
+                        "status":  result["status"],
+                        "error":   result.get("error") or "",
+                        "message": f"[{browser_name.upper()}] {result['id']} — {result['status']}",
+                    })
+                results.append(result)
+        except Exception as e:
+            traceback.print_exc()
+            logger.error("Browser '%s' crashed: %s", browser_name, e)
+        finally:
+            await bw.close()
+        return results
+
+    all_results = await asyncio.gather(*[_run_browser(b) for b in browsers])
+    matrix: dict = {}
+    for browser_results in all_results:
+        _merge_into_matrix(matrix, browser_results)
+    _compute_overall(matrix)
+    return matrix
+
+
+async def run_all_browsers_parallel(
+    test_cases: list,
+    url:        str,
+    browsers:   list,
+    emit_fn=None,
+) -> dict:
+    """Run all test cases on every browser in parallel. Returns result matrix dict."""
+    tasks       = [run_on_browser(b, test_cases, url, emit_fn) for b in browsers]
+    all_results = await asyncio.gather(*tasks)
+    matrix: dict = {}
+    for browser_results in all_results:
+        _merge_into_matrix(matrix, browser_results)
+    _compute_overall(matrix)
     return matrix

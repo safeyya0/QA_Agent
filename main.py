@@ -7,6 +7,7 @@ if sys.platform == "win32" and sys.version_info < (3, 12):
 import os
 import json
 import glob
+import logging
 import builtins
 from datetime import datetime
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
@@ -61,6 +62,30 @@ def _broadcast_done():
 
 
 builtins.print = _broadcast_print
+
+
+class _SSELogHandler(logging.Handler):
+    """Forward Python logging records to the SSE broadcast queue."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            line = self.format(record)
+            for q in list(_log_subs):
+                try:
+                    q.put_nowait(line)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+
+_sse_handler = _SSELogHandler()
+_sse_handler.setFormatter(logging.Formatter("[%(levelname)s] %(name)s: %(message)s"))
+
+# Attach to the root logger so all modules' loggers propagate here
+_root_logger = logging.getLogger()
+_root_logger.addHandler(_sse_handler)
+_root_logger.setLevel(logging.INFO)
 
 
 @app.get("/api/logs")
@@ -175,7 +200,7 @@ async def run_agent_with_spec(
 
     spec_text = ""
     if has_file:
-        allowed = (".md", ".txt", ".pdf", ".sfd")
+        allowed = (".md", ".txt", ".pdf", ".docx", ".doc")
         if not spec_file.filename.lower().endswith(allowed):
             raise HTTPException(status_code=400, detail=f"Unsupported file type. Allowed: {', '.join(allowed)}")
         content = await spec_file.read()
@@ -237,10 +262,10 @@ async def generate_report_only(
             spec_text = extract_spec_text(content, spec_file.filename)
             print(f"[SPEC] Loaded '{spec_file.filename}' — {len(spec_text)} chars")
             data = await agent.run_multi_browser_with_spec(
-                url.strip(), spec_text, browser_list, emit_fn=_broadcast_event
+                _normalize_url(url), spec_text, browser_list, emit_fn=_broadcast_event
             )
         else:
-            data = await agent.run_multi_browser(url.strip(), browser_list, emit_fn=_broadcast_event)
+            data = await agent.run_multi_browser(_normalize_url(url), browser_list, emit_fn=_broadcast_event)
 
         browser   = browser_list[0] if len(browser_list) == 1 else "multi"
         word_path = generate_word_report(data, browser=browser)
