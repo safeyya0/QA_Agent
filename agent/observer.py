@@ -17,7 +17,7 @@ class Observer:
 
         elements is a flat list of dicts, each with a 'category' key:
           'form_field'   — input / select / textarea
-          'action'       — button / [role=button] / submit / a.btn
+          'action'       — button / [role=button] / submit / a.btn / icon buttons
           'data_display' — table (headers + row count)
           'navigation'   — nav / sidebar / menu links
         """
@@ -28,19 +28,39 @@ class Observer:
         elements: list[dict[str, Any]] = []
         elements.extend(await self._extract_form_fields())
         elements.extend(await self._extract_buttons())
+        elements.extend(await self._extract_icon_elements())   # icon-only buttons
         elements.extend(await self._extract_tables())
         elements.extend(await self._extract_nav_links())
 
         page_info = await self._extract_page_info()
+        icons = sum(1 for e in elements if e.get("category") == "action" and e.get("is_icon"))
         logger.info(
-            "Observed %d elements (%d fields, %d actions, %d tables, %d nav) at %s",
+            "Observed %d elements (%d fields, %d actions [%d icons], %d tables, %d nav) at %s",
             len(elements),
             sum(1 for e in elements if e.get("category") == "form_field"),
             sum(1 for e in elements if e.get("category") == "action"),
+            icons,
             sum(1 for e in elements if e.get("category") == "data_display"),
             sum(1 for e in elements if e.get("category") == "navigation"),
             url,
         )
+        return elements, page_info
+
+    async def observe_current(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Observe the page currently loaded in the browser — does NOT navigate.
+
+        Use this after a login/redirect so the post-login page is inspected
+        instead of navigating back to the original URL.
+        """
+        await self.browser.wait_for_load()
+        elements: list[dict[str, Any]] = []
+        elements.extend(await self._extract_form_fields())
+        elements.extend(await self._extract_buttons())
+        elements.extend(await self._extract_icon_elements())
+        elements.extend(await self._extract_tables())
+        elements.extend(await self._extract_nav_links())
+        page_info = await self._extract_page_info()
+        logger.info("observe_current: %d elements at %s", len(elements), page_info.get("current_url", "?"))
         return elements, page_info
 
     # ── Form fields ────────────────────────────────────────────────────────────
@@ -144,6 +164,230 @@ class Observer:
             except Exception:
                 continue
 
+        return results
+
+    # ── Icon-only interactive elements ────────────────────────────────────────
+
+    async def _extract_icon_elements(self) -> list[dict[str, Any]]:
+        """Detect icon-only buttons/links that have no visible text.
+
+        Sources used (in priority order):
+          1. aria-label   — most reliable, set by developers for accessibility
+          2. title        — tooltip text
+          3. data-testid  — test identifiers often describe the element
+          4. <title> inside SVG — FontAwesome / custom SVG icons
+          5. CSS class pattern — e.g. 'cart', 'hamburger', 'toggle-sidebar'
+
+        Known icon families covered: Font Awesome, Material Icons, Bootstrap Icons,
+        Heroicons, Feather, Ant Design, Tabler, custom class-based icons.
+        """
+        page = self.browser.page
+        try:
+            raw: list[dict] = await page.evaluate(r"""
+                () => {
+                    // Map of class-name keywords → human label (order matters: more specific first)
+                    const CLASS_MAP = [
+                        // Cart / shop
+                        [['cart', 'bag', 'basket', 'shopping-cart'], 'Cart'],
+                        // Hamburger / sidebar toggle
+                        [['hamburger', 'burger', 'menu-toggle', 'nav-toggle',
+                          'sidebar-toggle', 'toggle-sidebar', 'menu-btn',
+                          'navbar-toggler', 'offcanvas-toggle'], 'Toggle Menu'],
+                        // Search
+                        [['search-icon', 'search-btn', 'searchbtn', 'magnif'], 'Search'],
+                        // User / profile
+                        [['user-icon', 'profile-icon', 'avatar', 'account-icon',
+                          'user-menu', 'profile-menu'], 'User Profile'],
+                        // Notifications / bell
+                        [['notification', 'notif-btn', 'bell-icon', 'alert-icon'], 'Notifications'],
+                        // Wishlist / favorite / heart
+                        [['wishlist', 'favorite', 'heart-icon', 'like-btn'], 'Wishlist'],
+                        // Share
+                        [['share-btn', 'share-icon'], 'Share'],
+                        // Filter / sort
+                        [['filter-btn', 'filter-icon', 'sort-btn', 'sort-icon',
+                          'refine', 'funnel'], 'Filter'],
+                        // Settings / gear
+                        [['settings-icon', 'settings-btn', 'gear-icon',
+                          'config-icon', 'preference'], 'Settings'],
+                        // Download / export
+                        [['download-btn', 'download-icon', 'export-btn'], 'Download'],
+                        // Help / info
+                        [['help-icon', 'info-icon', 'tooltip-icon'], 'Help'],
+                        // Close / dismiss
+                        [['close-btn', 'close-icon', 'dismiss-btn', 'modal-close',
+                          'dialog-close'], 'Close'],
+                        // Expand / collapse
+                        [['expand-btn', 'collapse-btn', 'accordion-toggle',
+                          'show-more', 'read-more'], 'Expand'],
+                        // Dark / light mode toggle
+                        [['dark-mode', 'light-mode', 'theme-toggle',
+                          'color-mode'], 'Toggle Theme'],
+                        // Language selector
+                        [['lang-switcher', 'language-toggle', 'locale-btn'], 'Language'],
+                        // Back / prev / next navigation
+                        [['back-btn', 'prev-btn', 'breadcrumb-back'], 'Back'],
+                        [['next-btn', 'next-arrow', 'forward-btn'], 'Next'],
+                    ];
+
+                    // Font Awesome class prefixes → label
+                    const FA_MAP = {
+                        'fa-shopping-cart': 'Cart',   'fa-shopping-bag': 'Cart',
+                        'fa-bars':          'Toggle Menu', 'fa-navicon': 'Toggle Menu',
+                        'fa-search':        'Search', 'fa-magnifying-glass': 'Search',
+                        'fa-user':          'User Profile', 'fa-user-circle': 'User Profile',
+                        'fa-bell':          'Notifications',
+                        'fa-heart':         'Wishlist', 'fa-star': 'Wishlist',
+                        'fa-share':         'Share',   'fa-share-alt': 'Share',
+                        'fa-filter':        'Filter',  'fa-sort':       'Sort',
+                        'fa-gear':          'Settings', 'fa-cog': 'Settings', 'fa-sliders': 'Settings',
+                        'fa-download':      'Download', 'fa-upload': 'Upload',
+                        'fa-question':      'Help',     'fa-info':    'Help',
+                        'fa-times':         'Close',    'fa-xmark':  'Close',
+                        'fa-home':          'Home',     'fa-house':  'Home',
+                        'fa-calendar':      'Calendar', 'fa-clock':  'History',
+                        'fa-trash':         'Delete',   'fa-pencil': 'Edit',
+                        'fa-plus':          'Add',      'fa-minus':  'Remove',
+                        'fa-moon':          'Toggle Theme', 'fa-sun': 'Toggle Theme',
+                        'fa-globe':         'Language',
+                    };
+
+                    // Material Icons text content → label
+                    const MATERIAL_MAP = {
+                        'shopping_cart': 'Cart',     'shopping_bag': 'Cart',
+                        'menu':          'Toggle Menu', 'menu_open': 'Toggle Menu',
+                        'search':        'Search',
+                        'person':        'User Profile', 'account_circle': 'User Profile',
+                        'notifications': 'Notifications', 'notification_important': 'Notifications',
+                        'favorite':      'Wishlist',  'star': 'Wishlist',
+                        'share':         'Share',
+                        'filter_list':   'Filter',    'sort': 'Sort',
+                        'settings':      'Settings',  'tune': 'Settings',
+                        'download':      'Download',  'upload': 'Upload',
+                        'help':          'Help',      'info': 'Help',
+                        'close':         'Close',
+                        'home':          'Home',
+                        'delete':        'Delete',    'edit': 'Edit',
+                        'add':           'Add',       'remove': 'Remove',
+                        'dark_mode':     'Toggle Theme', 'light_mode': 'Toggle Theme',
+                        'language':      'Language',
+                    };
+
+                    function labelFromEl(el) {
+                        // 1. aria-label
+                        const aria = (el.getAttribute('aria-label') || '').trim();
+                        if (aria) return aria;
+
+                        // 2. title attribute
+                        const title = (el.getAttribute('title') || '').trim();
+                        if (title) return title;
+
+                        // 3. data-testid / data-cy / data-qa
+                        for (const attr of ['data-testid', 'data-cy', 'data-qa', 'data-test']) {
+                            const v = (el.getAttribute(attr) || '').trim().replace(/[-_]/g, ' ');
+                            if (v && v.length < 40) return v;
+                        }
+
+                        // 4. SVG <title> child
+                        const svgTitle = el.querySelector('svg title, title');
+                        if (svgTitle) {
+                            const t = (svgTitle.textContent || '').trim();
+                            if (t && t.length < 50) return t;
+                        }
+
+                        const cls = (typeof el.className === 'string' ? el.className : (el.className.baseVal || '')).toLowerCase();
+                        const iconCls = [...el.querySelectorAll('[class]')]
+                            .map(c => (typeof c.className === 'string' ? c.className : (c.className.baseVal || '')).toLowerCase()).join(' ');
+                        const allCls = cls + ' ' + iconCls;
+
+                        // 5. Font Awesome icons (class="fas fa-shopping-cart")
+                        for (const [faClass, label] of Object.entries(FA_MAP)) {
+                            if (allCls.includes(faClass)) return label;
+                        }
+
+                        // 6. Material Icons (class="material-icons", inner text is the icon name)
+                        if (allCls.includes('material-icon')) {
+                            const text = (el.textContent || '').trim().toLowerCase();
+                            if (MATERIAL_MAP[text]) return MATERIAL_MAP[text];
+                        }
+
+                        // 7. CSS class keyword matching
+                        for (const [keywords, label] of CLASS_MAP) {
+                            if (keywords.some(kw => allCls.includes(kw))) return label;
+                        }
+
+                        return null;
+                    }
+
+                    const clickable = document.querySelectorAll(
+                        'button, [role="button"], a[href], [tabindex="0"], [onclick]'
+                    );
+
+                    const results = [];
+                    const seenLabels = new Set();
+
+                    for (const el of clickable) {
+                        // Skip elements that have readable text — those are caught by _extract_buttons
+                        const innerText = (el.innerText || '').trim();
+                        if (innerText.length > 3) continue;
+
+                        // Must be visible
+                        if (!el.offsetParent && el.getBoundingClientRect().width === 0) continue;
+
+                        const label = labelFromEl(el);
+                        if (!label) continue;
+
+                        const key = label.toLowerCase();
+                        if (seenLabels.has(key)) continue;
+                        seenLabels.add(key);
+
+                        const ariaLabel = (el.getAttribute('aria-label') || '').trim();
+                        results.push({
+                            label:      label,
+                            id:         el.id || '',
+                            tag:        el.tagName.toLowerCase(),
+                            aria_label: ariaLabel,
+                            href:       el.getAttribute('href') || '',
+                        });
+                    }
+                    return results;
+                }
+            """)
+        except Exception as exc:
+            logger.warning("Icon element extraction failed: %s", exc)
+            return []
+
+        # Build existing action text set to avoid duplicating text-based buttons
+        existing_page = self.browser.page
+        try:
+            existing_texts: set[str] = set()
+            for el in await existing_page.query_selector_all("button, [role='button']"):
+                try:
+                    t = (await el.inner_text()).strip().lower()
+                    if t:
+                        existing_texts.add(t)
+                except Exception:
+                    pass
+        except Exception:
+            existing_texts = set()
+
+        results: list[dict[str, Any]] = []
+        for item in raw:
+            label = (item.get("label") or "").strip()[:60]
+            if not label or label.lower() in existing_texts:
+                continue
+            aria = item.get("aria_label", "")
+            results.append({
+                "category":   "action",
+                "text":       label,
+                "id":         item.get("id", ""),
+                "selector":   f"[aria-label='{aria}']" if aria else "",
+                "is_icon":    True,
+            })
+
+        if results:
+            logger.info("Detected %d icon element(s): %s",
+                        len(results), [r["text"] for r in results])
         return results
 
     # ── Data tables ────────────────────────────────────────────────────────────

@@ -2,7 +2,7 @@
 import re
 import logging
 from typing import Any
-from tools.llm import generate_quick_test_cases, generate_tests_from_spec
+from tools.llm import generate_quick_test_cases, generate_tests_from_spec, convert_spec_scenarios_to_steps
 from tools.auth import detect_auth_forms
 
 logger = logging.getLogger(__name__)
@@ -100,12 +100,27 @@ class Planner:
             if e.get("type") == "select" and e.get("options")
         ]
 
+        # Icon-only buttons (cart, hamburger, etc.) — label derived by observer
+        icon_labels: list[str] = list(dict.fromkeys(
+            e["text"] for e in elements
+            if e.get("category") == "action" and e.get("is_icon") and e.get("text", "").strip()
+        ))
+
+        # Text-based buttons (exclude icons — already captured above)
+        text_action_texts: list[str] = list(dict.fromkeys(
+            e["text"] for e in elements
+            if e.get("category") == "action" and not e.get("is_icon") and e.get("text", "").strip()
+        ))
+
         ctx: dict[str, Any] = {
             "page_type":    page_context,
-            "buttons":      action_texts[:12],
+            "buttons":      text_action_texts[:12],
             "action_links": action_texts[:15],
             "has_table":    any(e.get("category") == "data_display" for e in elements),
         }
+
+        if icon_labels:
+            ctx["icons"] = icon_labels[:12]
 
         # Page metadata from observer
         if pi.get("title"):
@@ -156,38 +171,72 @@ class Planner:
         fields:    list[dict[str, Any]],
         url:       str,
         page_info: dict[str, Any] | None = None,
+        sections:  list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
-        """Generate test cases from a specification document."""
-        parsed   = self.parse_markdown_spec(spec_text)
-        md_cases = self.build_test_cases_from_parsed_md(parsed)
-        if md_cases:
-            logger.info("Extracted %d test cases from structured markdown.", len(md_cases))
+        """Execute the test scenarios found in the spec file against the live app.
 
-        logger.info("Generating test cases from spec (%d chars) — 3-pass LLM mode...", len(spec_text))
-        llm_cases = generate_tests_from_spec(spec_text, fields, url)
-        logger.info("Total from LLM: %d test cases.", len(llm_cases))
+        Primary path: parse the spec's own scenarios/requirements and convert each
+        one to executable Playwright steps.  The agent runs EXACTLY the tests that
+        are written in the file — nothing is invented.
 
-        seen       = {tc["description"].lower() for tc in md_cases}
-        deduped    = [tc for tc in llm_cases if tc.get("description", "").lower() not in seen]
-        test_cases = md_cases + deduped
+        Fallback (spec has no structured content): generate scenarios from the raw
+        spec text via the 4-pass LLM mode.
 
+        Args:
+            sections: nav sections discovered by Phase 2 (text + href pairs) so
+                      the LLM can write correct navigate steps with real hrefs.
+        """
+        parsed = self.parse_markdown_spec(spec_text)
+
+        has_structured = bool(
+            parsed.get("scenarios")
+            or parsed.get("requirements")
+            or parsed.get("user_stories")
+            or any(sec.get("content") for sec in parsed.get("sections", []))
+        )
+
+        if has_structured:
+            # ── PRIMARY: convert spec's own scenarios to executable steps ─────
+            logger.info(
+                "Spec has structured content (%d scenarios, %d requirements, %d stories) "
+                "— converting to executable test cases.",
+                len(parsed.get("scenarios", [])),
+                len(parsed.get("requirements", [])),
+                len(parsed.get("user_stories", [])),
+            )
+            test_cases = convert_spec_scenarios_to_steps(parsed, fields, url, sections=sections)
+            logger.info("Converted %d spec scenarios to executable test cases.", len(test_cases))
+        else:
+            # ── FALLBACK: spec is plain text — generate scenarios from content ─
+            logger.info(
+                "Spec has no structured scenarios — falling back to 4-pass generation (%d chars).",
+                len(spec_text),
+            )
+            test_cases = generate_tests_from_spec(spec_text, fields, url, sections=sections)
+            logger.info("Generated %d test cases from spec text.", len(test_cases))
+
+        # Preserve the original IDs from the spec file (TC-001, TC-002…) when available.
+        # Only renumber if the test case has no ID or a generic placeholder.
         for i, tc in enumerate(test_cases, 1):
-            tc["id"] = f"TC{i:03d}"
+            if not tc.get("id") or tc["id"].startswith("TC0"):
+                tc["id"] = f"TC{i:03d}"
 
-        logger.info("Total after merge: %d test cases.", len(test_cases))
-
-        if fields:
-            page_text = (page_info or {}).get("page_text", "")
-            auth_info = detect_auth_forms(fields, url, page_text)
-            if auth_info["has_login"] or auth_info["has_register"]:
-                test_cases = [self._auth_scenario(auth_info)] + test_cases
-
+        logger.info("Total spec test cases: %d.", len(test_cases))
         return test_cases
 
     # ── Markdown spec parser ───────────────────────────────────────────────────
 
     def parse_markdown_spec(self, spec_text: str) -> dict[str, Any]:
-        """Parse a markdown spec into sections, requirements, and BDD scenarios."""
+        """Parse a markdown spec into sections, requirements, and BDD scenarios.
+
+        Handles multiple formats:
+        - BDD: Given / When / Then blocks
+        - Table steps: | N° | Action | Résultat attendu | rows inside TC sections
+        - Requirements: - R1: / - REQ-1: bullet items
+        - Test data hints: **Données de test suggérées:** `key: val, ...`
+        - Sub-headings (#### Préconditions, #### Étapes du test) are kept inside
+          their parent TC scenario instead of terminating it.
+        """
         lines = spec_text.splitlines()
 
         result: dict[str, Any] = {
@@ -197,14 +246,17 @@ class Planner:
             "user_stories": [],
         }
 
-        _req_pat   = re.compile(r'^[-*]\s*(R\d+|REQ[-_]?\d+|FR\d+|NFR\d+)[:\s](.+)', re.IGNORECASE)
-        _tc_pat    = re.compile(r'^#{1,4}\s*(TC[-_]?\d+|Test\s+Case\s*\d*)[:\s]?(.*)', re.IGNORECASE)
-        _story_pat = re.compile(r'\bAs a\b.+\bI want\b', re.IGNORECASE)
-        _given_pat = re.compile(r'^\*{0,2}Given\*{0,2}[:\s]+(.+)', re.IGNORECASE)
-        _when_pat  = re.compile(r'^\*{0,2}When\*{0,2}[:\s]+(.+)', re.IGNORECASE)
-        _then_pat  = re.compile(r'^\*{0,2}Then\*{0,2}[:\s]+(.+)', re.IGNORECASE)
-        _step_pat  = re.compile(r'(?:Input|Step|Action)[:\s]+(.+?)\s*[=:]\s*(.+)', re.IGNORECASE)
-        _exp_pat   = re.compile(r'Expected[:\s]+(.+)', re.IGNORECASE)
+        _req_pat      = re.compile(r'^[-*]\s*(R\d+|REQ[-_]?\d+|FR\d+|NFR\d+)[:\s](.+)', re.IGNORECASE)
+        _tc_pat       = re.compile(r'^#{1,4}\s*(TC[-_]?\d+|Test\s+Case\s*\d*)[:\s\-]*(.*)', re.IGNORECASE)
+        _story_pat    = re.compile(r'\bAs a\b.+\bI want\b', re.IGNORECASE)
+        _given_pat    = re.compile(r'^\*{0,2}Given\*{0,2}[:\s]+(.+)', re.IGNORECASE)
+        _when_pat     = re.compile(r'^\*{0,2}When\*{0,2}[:\s]+(.+)', re.IGNORECASE)
+        _then_pat     = re.compile(r'^\*{0,2}Then\*{0,2}[:\s]+(.+)', re.IGNORECASE)
+        _step_pat     = re.compile(r'(?:Input|Step|Action)[:\s]+(.+?)\s*[=:]\s*(.+)', re.IGNORECASE)
+        _exp_pat      = re.compile(r'Expected[:\s]+(.+)', re.IGNORECASE)
+        _global_exp   = re.compile(r'\*\*R[ée]sultat\s+global[^*]*\*\*[:\s]*(.+)', re.IGNORECASE)
+        _testdata_pat = re.compile(r'Donn[ée]es de test[^`]*`([^`]+)`', re.IGNORECASE)
+        _bold_exp     = re.compile(r'\*\*([^*]+)\*\*[:\s]+(.+)')
 
         current_section  = None
         current_scenario = None
@@ -214,49 +266,98 @@ class Planner:
             if not s:
                 continue
 
+            # ── Heading line ─────────────────────────────────────────────────
             if s.startswith("#"):
-                if current_scenario:
-                    result["scenarios"].append(current_scenario)
-                    current_scenario = None
-
                 tc_m = _tc_pat.match(s)
                 if tc_m:
+                    # New TC heading — save previous scenario first
+                    if current_scenario:
+                        result["scenarios"].append(current_scenario)
+                    desc = tc_m.group(2).strip().lstrip("-– ").strip()
                     current_scenario = {
                         "id":          tc_m.group(1).replace(" ", "").upper(),
-                        "description": tc_m.group(2).strip(),
+                        "description": desc,
                         "given": [], "when": [], "then": [],
-                        "steps": [], "expected": "",
+                        "steps": [], "expected": "", "test_data": "",
                     }
+                    current_section = None
+                elif current_scenario is not None:
+                    # Sub-heading inside a TC (e.g. #### Étapes du test) —
+                    # do NOT close the scenario; just ignore the heading line
+                    pass
                 else:
+                    # Regular section heading outside any TC
+                    if current_scenario:
+                        result["scenarios"].append(current_scenario)
+                        current_scenario = None
                     heading = re.sub(r"^#+\s*", "", s)
                     result["sections"].append({"title": heading, "content": []})
                     current_section = heading
 
+            # ── Content inside a TC scenario ─────────────────────────────────
             elif current_scenario is not None:
-                given_m = _given_pat.match(s)
-                when_m  = _when_pat.match(s)
-                then_m  = _then_pat.match(s)
-                if given_m:
-                    current_scenario["given"].append(given_m.group(1).strip())
-                elif when_m:
-                    current_scenario["when"].append(when_m.group(1).strip())
-                elif then_m:
-                    val = then_m.group(1).strip()
+
+                # Markdown table row: | N° | Action | Résultat attendu |
+                if s.startswith("|"):
+                    cells = [c.strip() for c in s.split("|")]
+                    cells = [c for c in cells if c]  # drop empty edge tokens
+                    # Skip separator rows (|---|---|) and header rows
+                    is_sep    = all(re.match(r'^[-:]+$', c) for c in cells)
+                    is_header = cells and any(
+                        cells[0].lower() in ("n°", "n", "#", "no", "id", "étape")
+                        or "action" in cells[0].lower()
+                        for _ in [None]
+                    )
+                    if not is_sep and not is_header and cells:
+                        # Data row — first cell should be a step number
+                        if re.match(r'^\d+$', cells[0]):
+                            action_text   = cells[1] if len(cells) > 1 else ""
+                            expected_text = cells[2] if len(cells) > 2 else ""
+                            if action_text:
+                                current_scenario["steps"].append({
+                                    "field": "action",
+                                    "value": action_text,
+                                })
+                                if expected_text and not current_scenario["expected"]:
+                                    current_scenario["expected"] = expected_text
+
+                # BDD keywords
+                elif _given_pat.match(s):
+                    current_scenario["given"].append(_given_pat.match(s).group(1).strip())
+                elif _when_pat.match(s):
+                    current_scenario["when"].append(_when_pat.match(s).group(1).strip())
+                elif _then_pat.match(s):
+                    val = _then_pat.match(s).group(1).strip()
                     current_scenario["then"].append(val)
                     if not current_scenario["expected"]:
                         current_scenario["expected"] = val
-                elif s.startswith(("-", "*", "+")):
-                    item   = s.lstrip("-*+ ").strip()
-                    step_m = _step_pat.match(item)
-                    exp_m  = _exp_pat.match(item)
-                    if step_m:
-                        current_scenario["steps"].append({
-                            "field": step_m.group(1).strip(),
-                            "value": step_m.group(2).strip(),
-                        })
-                    elif exp_m and not current_scenario["expected"]:
-                        current_scenario["expected"] = exp_m.group(1).strip()
 
+                # Global expected result: **Résultat global attendu:** ...
+                # Always overrides the partial expected captured from table rows
+                elif _global_exp.search(s):
+                    m = _global_exp.search(s)
+                    current_scenario["expected"] = m.group(1).strip().strip("*").strip()
+
+                # Test data hint: **Données de test suggérées:** `Username: Admin, ...`
+                elif _testdata_pat.search(s):
+                    m = _testdata_pat.search(s)
+                    if not current_scenario["test_data"]:
+                        current_scenario["test_data"] = m.group(1).strip()
+
+                # Bullet step items
+                elif s.startswith(("-", "*", "+")):
+                    item  = s.lstrip("-*+ ").strip()
+                    sm    = _step_pat.match(item)
+                    em    = _exp_pat.match(item)
+                    if sm:
+                        current_scenario["steps"].append({
+                            "field": sm.group(1).strip(),
+                            "value": sm.group(2).strip(),
+                        })
+                    elif em and not current_scenario["expected"]:
+                        current_scenario["expected"] = em.group(1).strip()
+
+            # ── Content outside any TC ────────────────────────────────────────
             else:
                 req_m = _req_pat.match(s)
                 if req_m:

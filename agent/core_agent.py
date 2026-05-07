@@ -12,7 +12,7 @@ from agent.executor import Executor, run_all_browsers_multi_page, run_all_browse
 from agent.observer import Observer
 from agent.planner import Planner
 from tools.browser import BrowserWrapper
-from tools.trello import create_failure_card
+from tools.trello import create_failure_card, create_run_list
 from tools.auth import detect_auth_forms
 from config import (
     TEST_USERNAME, TEST_PASSWORD,
@@ -74,9 +74,22 @@ class CoreAgent:
         print(f"[REPORT] Saved to {path}")
         print(f"[REPORT] Total: {total} | Passed: {passed} | Failed: {failed} | Partial: {partial}")
 
-        # Trello cards for failures
-        for tid, data in matrix.items():
-            if data.get("overall") in ("FAILED", "PARTIAL"):
+        # Trello cards for failures — cap at 10 (FAILED first, then PARTIAL)
+        _MAX_TRELLO = 10
+        priority_tids = (
+            [tid for tid, d in matrix.items() if d.get("overall") == "FAILED"] +
+            [tid for tid, d in matrix.items() if d.get("overall") == "PARTIAL"]
+        )
+        if priority_tids:
+            # Create a dedicated Trello list for this run automatically
+            run_list_id: str | None = create_run_list(url)
+            if run_list_id:
+                logger.info("Trello: run list created (%s)", run_list_id)
+            else:
+                logger.info("Trello: no run list created — cards go to TRELLO_LIST_ID fallback.")
+
+            for tid in priority_tids[:_MAX_TRELLO]:
+                data = matrix[tid]
                 failed_browsers = [
                     b for b, bd in data.get("browsers", {}).items()
                     if bd.get("status") not in ("PASSED", "SKIPPED")
@@ -98,7 +111,12 @@ class CoreAgent:
                     error_details=error_str or "Test failed",
                     screenshot_path=screenshot,
                     description=data.get("description", ""),
+                    list_id=run_list_id,
                 )
+            skipped = len(priority_tids) - min(len(priority_tids), _MAX_TRELLO)
+            if skipped > 0:
+                logger.info("Trello: capped at %d cards (%d additional failures skipped).",
+                            _MAX_TRELLO, skipped)
 
         report["report_file"] = os.path.basename(path)
         return report
@@ -400,6 +418,26 @@ class CoreAgent:
             # Screenshot dashboard
             await bw.take_screenshot("phase2_dashboard")
 
+            # Try to expand hidden navigation (hamburger / sidebar toggles)
+            _toggle_sels = [
+                "[class*='hamburger']", "[class*='burger']",
+                "[class*='menu-toggle']", "[class*='nav-toggle']",
+                "[class*='sidebar-toggle']", "[class*='navbar-toggler']",
+                "[aria-label*='menu' i]", "[aria-label*='toggle' i]",
+                "[aria-label*='navigation' i]", "[aria-controls*='nav' i]",
+                "#menu-toggle", "#nav-toggle", ".menu-icon", ".nav-icon",
+            ]
+            for _tsel in _toggle_sels:
+                try:
+                    _loc = bw.page.locator(_tsel).first
+                    if await _loc.count() > 0 and await _loc.is_visible():
+                        await _loc.click()
+                        await asyncio.sleep(0.8)
+                        logger.info("Phase 2: expanded nav via '%s'", _tsel)
+                        break
+                except Exception:
+                    continue
+
             # Extract all nav/sidebar/menu links
             base_domain = urlparse(url).netloc.removeprefix("www.")
             raw_links: list[str] = await bw.page.evaluate("""
@@ -411,6 +449,20 @@ class CoreAgent:
                                && !h.match(/\\.(pdf|zip|jpg|png|gif|svg|css|js)$/i));
                 }
             """)
+
+            def _clean_text(t: str) -> str:
+                cleaned = ""
+                for ch in t:
+                    cp = ord(ch)
+                    if 0xE000 <= cp <= 0xF8FF:   # Basic PUA (icon fonts)
+                        continue
+                    if 0xF0000 <= cp <= 0xFFFFF:  # Supplementary PUA
+                        continue
+                    if cp < 0x20 or cp == 0x7F:   # Control chars
+                        cleaned += ' '
+                        continue
+                    cleaned += ch
+                return ' '.join(cleaned.split())
 
             _SKIP_KWS = ("logout", "signout", "sign-out", "log-out")
             sections: list[dict] = []
@@ -434,7 +486,10 @@ class CoreAgent:
                 except Exception:
                     text = parsed.path
 
-                sections.append({"text": text or parsed.path, "href": link, "norm": norm})
+                text = _clean_text(text or parsed.path)
+                if not text:
+                    text = parsed.path
+                sections.append({"text": text, "href": link, "norm": norm})
 
             sections = sections[:MAX_SECTIONS]
             print(f"[PHASE 2] Discovered {len(sections)} sections: {[s['text'] for s in sections]}")
@@ -813,75 +868,158 @@ class CoreAgent:
         browsers:  list[str],
         emit_fn=None,
     ) -> dict:
-        """Spec-driven run: generate plan from spec, then execute if URL provided."""
+        """Requirements-driven run: execute tests derived from the spec file against the URL.
+
+        Flow:
+          1. If no URL → generate test plan (PLANNED) only, no execution.
+          2. If URL provided:
+             a. Phase 1 auth — resolve credentials from the live app.
+             b. Observe the URL (authenticated if possible) — get real field names.
+             c. Generate test cases from spec + real fields (LLM 4-pass).
+             d. Execute every spec test case against the live app.
+             e. Merge auth results + spec execution results and report.
+        """
         if not browsers:
             browsers = ["chromium"]
 
         has_url = bool(url and url.strip())
         planner = Planner()
 
-        # ── Spec plan ──────────────────────────────────────────────────────────
-        spec_cases  = planner.plan_from_spec(spec_text, [], "", {})
-        spec_matrix = {
-            tc["id"]: {
-                "title":       tc.get("description", ""),
-                "description": tc.get("description", ""),
-                "expected":    tc.get("expected", ""),
-                "steps":       tc.get("steps", []),
-                "type":        tc.get("type", "standard"),
-                "browsers":    {},
-                "overall":     "PLANNED",
-            }
-            for tc in spec_cases
-        }
-
+        # ── Plan-only mode (no URL) ──────────────────────────────────────────
         if not has_url:
+            print("[SPEC] No URL provided — generating requirements test plan only.")
+            if emit_fn:
+                emit_fn({"log": "[SPEC] Pas d'URL — génération du plan de test uniquement."})
+            spec_cases = await asyncio.to_thread(
+                planner.plan_from_spec, spec_text, [], "", {}
+            )
+            spec_matrix = {
+                tc["id"]: {
+                    "title":       tc.get("description", ""),
+                    "description": tc.get("description", ""),
+                    "expected":    tc.get("expected", ""),
+                    "steps":       tc.get("steps", []),
+                    "type":        tc.get("type", "standard"),
+                    "browsers":    {},
+                    "overall":     "PLANNED",
+                }
+                for tc in spec_cases
+            }
             return self._save_and_build_report("", browsers, spec_cases, spec_matrix, plan_only=True)
 
-        # ── Live execution ─────────────────────────────────────────────────────
+        # ── Live execution mode (spec + URL) ─────────────────────────────────
+        print(f"[SPEC] Requirements-driven test run on {url}")
+        if emit_fn:
+            emit_fn({"log": f"[SPEC] Tests guidés par exigences sur {url}"})
+
         try:
-            bw       = BrowserWrapper()
-            observer = Observer(bw)
+            # ── Phase 1: auth — get credentials and run auth test cases ───────
+            auth_matrix, credentials = await self._phase_auth(url, browsers, emit_fn)
+
+            # ── Observe URL (authenticated if possible) — real field names ────
+            print("[SPEC] Observing live page to extract real form fields…")
+            if emit_fn:
+                emit_fn({"log": "[SPEC] Observation de la page pour les champs réels…"})
+
+            bw             = BrowserWrapper()
+            observer       = Observer(bw)
+            real_fields:    list[dict] = []
+            page_info_live: dict       = {}
+            spec_sections:  list[dict] = []
             try:
                 await bw.start(browsers[0])
-                elements, page_info = await observer.observe(url)
+                await bw.open_page(url)
+                if credentials:
+                    # Log in — then observe the POST-LOGIN page (dashboard), not the login URL
+                    login_fields = await bw.extract_inputs()
+                    for f in login_fields:
+                        fid   = (f.get("id") or f.get("name") or "").lower()
+                        ftype = (f.get("type") or "").lower()
+                        ident = f.get("id") or f.get("name") or ftype
+                        if any(k in fid for k in ("user", "email", "login", "name")) or ftype in ("text", "email"):
+                            await bw.fill_field(ident, credentials["username"])
+                        elif ftype == "password":
+                            await bw.fill_field(ident, credentials["password"])
+                    await bw.click_submit()
+                    try:
+                        await bw.page.wait_for_load_state("networkidle", timeout=6000)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(1)
+                    # Use observe_current so we see the dashboard, not the login page
+                    elements, page_info_live = await observer.observe_current()
+                else:
+                    elements, page_info_live = await observer.observe(url)
+                real_fields = [e for e in elements if e.get("category") == "form_field"]
+                logger.info("Observed %d elements (%d form fields) at %s",
+                            len(elements), len(real_fields),
+                            page_info_live.get("current_url", url))
+            except Exception as obs_exc:
+                logger.warning("Live observation failed: %s — proceeding without real fields.", obs_exc)
             finally:
                 await bw.close()
+
+            # ── Phase 2: discover real section URLs so LLM generates correct navigate steps
+            print("[SPEC] Discovering app sections for accurate navigation…")
+            if emit_fn:
+                emit_fn({"log": "[SPEC] Découverte des sections pour navigation précise…"})
+            spec_sections = await self._phase_discover(url, credentials, browsers[0], emit_fn)
+            if spec_sections:
+                print(f"[SPEC] {len(spec_sections)} sections discovered — LLM will use real URLs.")
+
+            # ── Generate test cases from spec + real fields + real section URLs ─
+            print(f"[SPEC] Generating test cases from requirements file ({len(spec_text)} chars, {len(real_fields)} real fields, {len(spec_sections)} sections)…")
+            if emit_fn:
+                emit_fn({"log": f"[SPEC] Génération depuis les exigences ({len(spec_text)} chars)…"})
+
+            spec_cases = await asyncio.to_thread(
+                planner.plan_from_spec, spec_text, real_fields, url, page_info_live, spec_sections
+            )
+            print(f"[SPEC] {len(spec_cases)} test cases generated from requirements.")
+            if emit_fn:
+                emit_fn({"log": f"[SPEC] {len(spec_cases)} tests générés depuis les exigences."})
+
+            # ── Execute spec test cases against the live app ──────────────────
+            # Skip auth_flow — already executed in Phase 1
+            # Deduplicate by description (case-insensitive) before executing
+            seen_desc: set[str] = set()
+            exec_cases: list[dict] = []
+            for tc in spec_cases:
+                if tc.get("type") == "auth_flow":
+                    continue
+                key = tc.get("description", "").strip().lower()
+                if key and key in seen_desc:
+                    logger.info("Skipping duplicate spec test: '%s'", tc.get("description", ""))
+                    continue
+                seen_desc.add(key)
+                exec_cases.append(tc)
+
+            url_tc_pairs: list[tuple[str, dict]] = [
+                (tc.get("target_url") or url, tc) for tc in exec_cases
+            ]
+
+            spec_matrix: dict = {}
+            if url_tc_pairs:
+                print(f"[SPEC] Executing {len(url_tc_pairs)} spec tests × {len(browsers)} browser(s)…")
+                if emit_fn:
+                    emit_fn({"log": f"[SPEC] Exécution de {len(url_tc_pairs)} tests × {len(browsers)} navigateur(s)…"})
+                spec_matrix = await run_all_browsers_multi_page(
+                    url_tc_pairs, browsers, emit_fn,
+                    credentials=credentials,
+                    login_url=url,
+                )
+
+            # ── Merge: spec results only (auth_matrix used for creds only) ───────
+            # auth_matrix is intentionally excluded — the spec file already contains
+            # login/logout scenarios (TC-001, TC-002, TC-012…). Including auth_matrix
+            # would duplicate those tests under AUTH_FLOW_001 / VALID_LOGIN IDs.
+            matrix: dict = dict(spec_matrix)
+
         except Exception as exc:
             traceback.print_exc()
-            logger.error("Cannot observe %s: %s — spec plan only.", url, exc)
-            return self._save_and_build_report(url, browsers, spec_cases, spec_matrix, plan_only=True)
+            return {"error": repr(exc)}
 
-        page_text  = page_info.get("page_text", "")
-        matrix     = dict(spec_matrix)
-
-        fields     = [e for e in elements if e.get("category") == "form_field"]
-        if fields:
-            live_cases = planner.plan(elements, url, page_info)
-            for tc in live_cases:
-                if not tc.get("id", "").startswith("AUTH"):
-                    tc["id"] = "LIVE_" + tc.get("id", "X")
-
-            print(f"[SPEC+URL] {len(spec_cases)} spec + {len(live_cases)} live × {len(browsers)} browser(s)")
-            live_matrix = await run_all_browsers_parallel(live_cases, url, browsers, emit_fn)
-            matrix.update(live_matrix)
-
-            creds = (
-                self._extract_credentials_from_page(page_text)
-                or self._find_credentials_from_steps(live_cases)
-            )
-            if creds:
-                sections = await self._phase_discover(url, creds, browsers[0], emit_fn)
-                if sections:
-                    deep = await self._phase_deep_test(url, sections, creds, browsers, emit_fn)
-                    matrix.update(deep)
-        else:
-            print(f"[SPEC+URL] No form fields on {url} — spec plan kept as PLANNED")
-
-        all_cases = spec_cases + (live_cases if fields else [])
-        return self._save_and_build_report(
-            url, browsers, all_cases, matrix, plan_only=not bool(fields)
-        )
+        return self._save_and_build_report(url, browsers, spec_cases, matrix)
 
     # ── Backward-compat single-browser wrappers ────────────────────────────────
 

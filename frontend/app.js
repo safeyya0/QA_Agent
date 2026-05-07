@@ -18,8 +18,7 @@ document.querySelectorAll('.tab').forEach(tab => {
     const isSpec = tab.dataset.tab === 'spec';
     document.getElementById('tab-url').style.display  = isSpec ? 'none'  : 'block';
     document.getElementById('tab-spec').style.display = isSpec ? 'block' : 'none';
-    const browserCard = document.getElementById('browser-card');
-    if (browserCard) browserCard.style.display = isSpec ? 'none' : '';
+    // Browser selection stays visible in both modes
   });
 });
 
@@ -155,8 +154,7 @@ function updateProgress(data) {
 // ── Start agent ────────────────────────────────────────────────────────────
 async function startAgent() {
   const activeTab = document.querySelector('.tab.active').dataset.tab;
-  // In spec mode the browser card is hidden — use chromium silently
-  const browsers = activeTab === 'spec' ? ['chromium'] : selectedBrowsers;
+  const browsers = selectedBrowsers;
   if (browsers.length === 0) {
     alert('Sélectionnez au moins un navigateur.');
     return;

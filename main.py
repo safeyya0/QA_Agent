@@ -265,7 +265,9 @@ async def generate_report_only(
                 _normalize_url(url), spec_text, browser_list, emit_fn=_broadcast_event
             )
         else:
-            data = await agent.run_multi_browser(_normalize_url(url), browser_list, emit_fn=_broadcast_event)
+            data = await agent.run_multi_browser(
+                _normalize_url(url), browser_list, emit_fn=_broadcast_event
+            )
 
         browser   = browser_list[0] if len(browser_list) == 1 else "multi"
         word_path = generate_word_report(data, browser=browser)

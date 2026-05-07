@@ -280,7 +280,21 @@ def generate_test_cases(fields: list, url: str, auth_info: dict | None = None,
     return generate_quick_test_cases(fields, url, page_text, page_context or None)
 
 
-def generate_tests_from_spec(spec_text: str, fields: list, url: str) -> list:
+def generate_tests_from_spec(
+    spec_text: str,
+    fields: list,
+    url: str,
+    sections: list | None = None,
+) -> list:
+    """Generate test cases from a spec file + live page context.
+
+    Args:
+        spec_text: raw text of the requirements/spec file
+        fields:    real form fields observed on the live page
+        url:       base URL of the application
+        sections:  nav sections discovered by Phase 2 (text + href pairs)
+                   — used so the LLM can write correct navigate steps
+    """
     model    = get_llm_spec(max_tokens=2000)
     has_url  = bool(url and url.strip())
 
@@ -288,22 +302,36 @@ def generate_tests_from_spec(spec_text: str, fields: list, url: str) -> list:
         f"Detected form fields on {url}:\n{json.dumps(fields, indent=2)}"
         if fields else "No live page fields — generate a narrative test plan from the spec."
     )
-    url_section   = f"Target URL: {url}" if has_url else "No URL — this is a test plan document only."
+    url_section = f"Target URL: {url}" if has_url else "No URL — this is a test plan document only."
+
+    # Include real section URLs so LLM generates correct navigate steps
+    sections_section = ""
+    if sections:
+        lines = "\n".join(
+            f"  - {s.get('text', '').strip()}: {s.get('href', '')}"
+            for s in sections[:20]
+            if s.get("href")
+        )
+        sections_section = f"\nDiscovered app sections (use these EXACT hrefs in navigate steps):\n{lines}\n"
+
     spec_body     = spec_text[:2500]
     common_footer = (
-        f"\n{url_section}\n\n{fields_section}\n\n"
+        f"\n{url_section}\n\n{fields_section}\n{sections_section}\n"
         f"Specification:\n---\n{spec_body}\n---\n"
     )
 
     if has_url:
-        # ── With URL: interactive steps (fill/submit/wait) ────────────────────
+        # ── With URL: interactive steps (fill/submit/navigate) ────────────────
         _step_fmt = (
             'Steps use action objects:\n'
+            '  {"action":"navigate","value":"EXACT_HREF_FROM_sections"}  — navigate to a section (use exact href above)\n'
             '  {"action":"fill","field":"fieldName","value":"val"}\n'
             '  {"action":"submit"}\n'
             '  {"action":"wait","value":"2"}\n'
             '  {"action":"clear","field":"fieldName"}\n'
-            'Every scenario MUST have at least 3 steps and one {"action":"submit"}.\n'
+            'IMPORTANT: For scenarios that require navigating to a specific module, '
+            'use {"action":"navigate"} as the FIRST step with the exact href from "Discovered app sections".\n'
+            'Every scenario MUST have at least 3 steps.\n'
         )
         _json_fmt = (
             'Return ONLY valid JSON — no markdown, no text outside it:\n'
@@ -372,10 +400,8 @@ def generate_tests_from_spec(spec_text: str, fields: list, url: str) -> list:
         "Coverage rules for this pass:\n"
         "- Empty / blank input flows\n"
         "- Maximum length boundary values\n"
-        "- SQL injection attempt\n"
-        "- XSS injection attempt\n"
         "- Invalid formats (wrong email, wrong date, negative numbers)\n"
-        "- Special characters and unicode\n"
+        "- Special characters in text fields\n"
         "- Missing mandatory fields\n\n"
         f"Do NOT repeat: {covered}\n"
         f"Start IDs at TC{n2:03d}.\n\n"
@@ -457,6 +483,143 @@ def generate_tests_from_spec(spec_text: str, fields: list, url: str) -> list:
     return total
 
 
+def convert_spec_scenarios_to_steps(
+    parsed: dict,
+    fields: list,
+    url: str,
+    sections: list | None = None,
+) -> list:
+    """Convert scenarios/requirements extracted from a spec file into executable Playwright steps.
+
+    This is the PRIMARY path when the user uploads a spec file — the agent executes
+    exactly the scenarios written in the file, not LLM-generated ones.
+
+    Args:
+        parsed:   output of Planner.parse_markdown_spec()
+        fields:   real form fields observed on the live page
+        url:      base URL of the application
+        sections: nav sections from Phase 2 discovery (text + href)
+    """
+    scenarios    = parsed.get("scenarios", [])
+    requirements = parsed.get("requirements", [])
+    user_stories = parsed.get("user_stories", [])
+    sections_raw = parsed.get("sections", [])
+
+    if not scenarios and not requirements and not user_stories and not sections_raw:
+        logger.info("Spec has no structured content — convert_spec_scenarios_to_steps returns empty.")
+        return []
+
+    model = get_llm_spec(max_tokens=2500)
+
+    # ── Build navigation context ──────────────────────────────────────────────
+    sections_ctx = ""
+    if sections:
+        lines = "\n".join(
+            f"  - {s.get('text', '').strip()}: {s.get('href', '')}"
+            for s in sections[:20] if s.get("href")
+        )
+        sections_ctx = f"\nApp sections (use EXACT hrefs for navigate steps):\n{lines}\n"
+
+    fields_ctx = ""
+    if fields:
+        names = [f.get("label") or f.get("name") or f.get("id", "") for f in fields[:12]]
+        fields_ctx = f"\nForm fields on page: {', '.join(filter(None, names))}\n"
+
+    url_ctx = f"Base URL: {url}\n" if url else ""
+
+    # ── Serialise all spec content ────────────────────────────────────────────
+    spec_content = ""
+
+    for i, sc in enumerate(scenarios, 1):
+        spec_content += f"\n=== Scenario {i} [{sc.get('id','')}]: {sc.get('description', '')}\n"
+        if sc.get("given"):
+            spec_content += "Given: " + "; ".join(sc["given"]) + "\n"
+        if sc.get("when"):
+            spec_content += "When: " + "; ".join(sc["when"]) + "\n"
+        if sc.get("then"):
+            spec_content += "Then: " + "; ".join(sc["then"]) + "\n"
+        # Table-parsed steps (field="action", value="step description")
+        for step in sc.get("steps", []):
+            spec_content += f"  Step: {step.get('value', '')}\n"
+        if sc.get("expected"):
+            spec_content += f"Expected: {sc['expected']}\n"
+        if sc.get("test_data"):
+            spec_content += f"Test data: {sc['test_data']}\n"
+
+    for req in requirements:
+        spec_content += f"\n=== Requirement {req['id']}: {req['text']}\n"
+
+    for story in user_stories:
+        spec_content += f"\n=== User Story: {story}\n"
+
+    # Free-text sections (no BDD structure — use as-is)
+    for sec in sections_raw:
+        if sec.get("content"):
+            spec_content += f"\n=== Section: {sec['title']}\n"
+            spec_content += "\n".join(sec["content"][:8]) + "\n"
+
+    system_msg = (
+        "You are a senior QA Engineer. Convert EACH scenario into an executable automated test case.\n\n"
+        "LANGUAGE RULE — CRITICAL:\n"
+        "The spec file may be in French OR English. The application UI may also be in French OR English.\n"
+        "You must map the INTENT of each spec step to the actual UI element, regardless of language.\n"
+        "Use the 'App sections' list (real discovered names + hrefs) as the source of truth for navigation.\n"
+        "Common concept mappings (spec → UI element, whichever language the app uses):\n"
+        "  logout / déconnexion     → button/link labeled 'Logout' or 'Se déconnecter'\n"
+        "  add / ajouter            → button labeled 'Add' or 'Ajouter'\n"
+        "  save / enregistrer       → button labeled 'Save' or 'Enregistrer'\n"
+        "  delete / supprimer       → button labeled 'Delete' or 'Supprimer'\n"
+        "  search / rechercher      → button/field labeled 'Search' or 'Rechercher'\n"
+        "  edit / modifier          → button labeled 'Edit' or 'Modifier'\n"
+        "  username / identifiant   → fill field='username'\n"
+        "  password / mot de passe  → fill field='password'\n"
+        "  leave / congé            → navigate to Leave/Congés section href\n"
+        "  employees / employés     → navigate to PIM/Employees section href\n\n"
+        "Step action types (use ONLY these):\n"
+        '  {"action":"navigate","value":"EXACT_HREF"}   ← use hrefs from App sections list\n'
+        '  {"action":"fill","field":"fieldName","value":"testValue"}\n'
+        '  {"action":"click","value":"label as shown in the app UI"}\n'
+        '  {"action":"click_row_action","row":"identifying text in the row","value":"delete|edit"}  ← icon button in table row\n'
+        '  {"action":"submit"}\n'
+        '  {"action":"verify_text","value":"short text visible on page in the app language"}\n'
+        '  {"action":"wait","value":"2"}\n\n'
+        "STRICT RULES:\n"
+        "1. ONE test case per scenario — do NOT skip any\n"
+        "2. LOGIN: navigate → fill username → fill password → submit → verify_text\n"
+        "   submit is MANDATORY before verify_text in any form scenario\n"
+        "3. LOGOUT: click value matching 'Logout'/'Se déconnecter' (try user avatar/profile menu first)\n"
+        "4. NAVIGATION: navigate with EXACT href from App sections, then verify_text with a page title visible on that page\n"
+        "5. verify_text: a short word/phrase genuinely visible on the target page\n"
+        "   Good: page titles, section headings, button labels already on the page\n"
+        "   Bad: invented confirmation phrases ('Employee Created', 'Leave Applied', 'Welcome')\n"
+        "6. Use test_data values (Username/Password) from the scenario's 'Test data' field\n"
+        "7. For navigate: ALWAYS use exact href from App sections — never invent URLs\n"
+        "8. description ≤ 70 chars, expected ≤ 70 chars\n"
+        "9. TABLE DELETE/EDIT: When the spec asks to delete or edit a row in a table, use click_row_action.\n"
+        "   The 'row' field must contain unique text visible in that row (e.g. the username).\n"
+        "   Example — delete user FMLName: {\"action\":\"click_row_action\",\"row\":\"FMLName\",\"value\":\"delete\"}\n"
+        "   Example — edit user FMLName:  {\"action\":\"click_row_action\",\"row\":\"FMLName\",\"value\":\"edit\"}\n"
+        "   NOTE: An admin user cannot delete itself — use a non-admin username in the 'row' field.\n\n"
+        "Return ONLY valid JSON:\n"
+        '{"test_cases":[{"id":"TC001","description":"...","steps":[...],"expected":"..."}]}'
+    )
+
+    human_msg = (
+        f"{url_ctx}{fields_ctx}{sections_ctx}\n"
+        f"Spec scenarios and requirements to convert:\n{spec_content}\n\n"
+        "Convert EVERY scenario above to an executable test case."
+    )
+
+    msgs = [SystemMessage(content=system_msg), HumanMessage(content=human_msg)]
+    try:
+        result = _parse_json_array(_invoke(model, msgs), model, msgs)
+        logger.info("Converted %d spec scenarios to executable test cases.", len(result))
+        return result
+    except Exception as exc:
+        logger.warning("convert_spec_scenarios_to_steps failed (%s) — returning empty.", exc)
+        return []
+
+
 def extract_spec_text(file_content: bytes, filename: str) -> str:
     lower = filename.lower()
     if lower.endswith(".pdf"):
@@ -526,7 +689,7 @@ def _build_interface_context(fields: list, url: str,
 
     # Auth context (highest priority — specialised prompts generated later)
     if ctx.get("auth_type") == "login":
-        lines.append("Form type: LOGIN — test valid credentials, wrong password, SQL injection, empty fields, locked account, case sensitivity")
+        lines.append("Form type: LOGIN — test valid credentials, wrong password, empty fields, locked account, case sensitivity")
     elif ctx.get("auth_type") == "register":
         lines.append("Form type: REGISTER — test valid signup, duplicate email, weak password, required fields, format validation")
 
@@ -555,6 +718,8 @@ def _build_interface_context(fields: list, url: str,
     if ctx.get("action_links"):
         unique = list(dict.fromkeys(ctx["action_links"]))[:15]
         lines.append(f"All clickable: {' | '.join(unique)}")
+    if ctx.get("icons"):
+        lines.append(f"Icon buttons (no text): {' | '.join(ctx['icons'][:12])}")
     if ctx.get("selects"):
         for sel in ctx["selects"][:4]:
             opts = ", ".join(sel.get("options", [])[:6])
@@ -578,7 +743,9 @@ _ACTIONS_DOC = (
     '  {"action":"fill","field":"EXACT_FIELD_ID","value":"val"}  — fill a KNOWN field by id/name\n'
     '  {"action":"fill_form","value":"hint text"}                — fill ALL visible fields on current page (use after click opens a form)\n'
     '  {"action":"select","field":"EXACT_FIELD_ID","value":"opt"}— pick dropdown option\n'
-    '  {"action":"click","text":"Exact Button Text"}             — click button/link using EXACT text from "All clickable" or "Buttons/Links"\n'
+    '  {"action":"click","text":"Exact Button Text"}             — click button/link by text, OR icon label from "Icon buttons"\n'
+    '  {"action":"click","text":"Cart"}                          — example: click the cart icon (use exact label from "Icon buttons")\n'
+    '  {"action":"click","text":"Toggle Menu"}                   — open hamburger/sidebar toggle (use exact label from "Icon buttons")\n'
     '  {"action":"check","field":"checkboxName"}                 — tick checkbox\n'
     '  {"action":"navigate","value":"/path"}                     — go to URL path\n'
     '  {"action":"submit"}                                       — submit the current form\n'
@@ -612,7 +779,8 @@ _ACTIONS_DOC = (
 _OUTPUT_RULES = (
     'OUTPUT RULES (strictly enforced):\n'
     '- 2 to 5 steps per scenario\n'
-    '- click: EXACT text from "Buttons/Links" or "All clickable" — never invent button text\n'
+    '- click: EXACT text from "Buttons/Links", "All clickable", OR label from "Icon buttons"\n'
+    '- Icon buttons MUST be tested: if "Icon buttons" section lists Cart, Toggle Menu, etc., generate at least one scenario per icon\n'
     '- fill: ONLY when field id/name is listed in "Form fields" section\n'
     '- fill_form: use instead of fill when a click opens a NEW form (Add/Edit flows)\n'
     '- verify_text: end every CRUD test with this action\n'
@@ -719,11 +887,12 @@ def _identify_scenarios(interface_ctx: str) -> list[str]:
             f"{crud_guidance}\n"
             "ALSO check:\n"
             "  - 'All clickable' / 'Buttons/Links': Add/Edit/Delete/Search buttons → one scenario each\n"
+            "  - 'Icon buttons': Cart, Toggle Menu, Search, User Profile, etc. → one scenario EACH (open it, verify it works)\n"
             "  - 'Form fields': empty required, invalid format, boundary length\n"
             "  - 'Data table present': verify it loads\n\n"
             "Return ONLY a raw JSON array of short French descriptions (max 40 chars each).\n"
             "No preamble — start directly with [\n"
-            'Example: ["Ajouter un employé","Modifier un employé","Supprimer",'
+            'Example: ["Ajouter un employé","Ouvrir le panier","Ouvrir le menu latéral",'
             '"Rechercher par nom","Champ requis vide","Valeur limite"]'
         )
     try:

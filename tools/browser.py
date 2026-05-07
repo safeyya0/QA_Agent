@@ -204,25 +204,59 @@ class BrowserWrapper:
                 continue
         logger.debug("Dropdown '%s' not found — skipped.", field_identifier)
 
+    # Icon label → CSS class keyword patterns for class-based fallback
+    _ICON_CLASS_HINTS: dict[str, list[str]] = {
+        "cart":          ["cart", "bag", "basket", "shopping-cart"],
+        "toggle menu":   ["hamburger", "burger", "menu-toggle", "nav-toggle",
+                          "sidebar-toggle", "menu-btn", "navbar-toggler"],
+        "search":        ["search-icon", "search-btn", "searchbtn"],
+        "user profile":  ["user-icon", "profile-icon", "avatar", "account-icon"],
+        "notifications": ["notification", "notif-btn", "bell-icon"],
+        "wishlist":      ["wishlist", "favorite", "heart-icon"],
+        "filter":        ["filter-btn", "filter-icon", "funnel"],
+        "settings":      ["settings-icon", "gear-icon", "cog-icon"],
+        "download":      ["download-btn", "download-icon"],
+        "close":         ["close-btn", "close-icon", "dismiss-btn", "modal-close"],
+        "toggle theme":  ["dark-mode", "light-mode", "theme-toggle"],
+    }
+
     async def click_element(self, text_or_selector: str):
-        """Click any element — by visible text, aria-label, title, or CSS selector."""
+        """Click any element — by visible text, aria-label, title, or CSS selector.
+
+        For icon buttons (no text), tries aria-label and class-keyword selectors
+        derived from the detected icon label (e.g. 'Cart' → [class*='cart']).
+        """
         t = text_or_selector
         candidates = [
+            # Standard text-based selectors
             f"button:has-text('{t}')",
             f"a:has-text('{t}')",
-            f"[aria-label*='{t}' i]",
-            f"[title*='{t}' i]",
-            f"input[value='{t}']",
             f"[role='button']:has-text('{t}')",
             f"li:has-text('{t}') a",
-            t,  # treat as raw CSS selector
+            # Accessibility attributes (icon buttons)
+            f"[aria-label='{t}']",
+            f"[aria-label*='{t}' i]",
+            f"[title='{t}']",
+            f"[title*='{t}' i]",
+            f"input[value='{t}']",
+            f"[data-testid*='{t}' i]",
+            # Raw CSS selector fallback
+            t,
         ]
+
+        # For known icon labels, also try class-based selectors
+        t_lower = t.lower()
+        for label, class_hints in self._ICON_CLASS_HINTS.items():
+            if label in t_lower or t_lower in label:
+                for hint in class_hints:
+                    candidates.append(f"[class*='{hint}']")
+                break
+
         for sel in candidates:
             try:
                 loc = self.page.locator(sel).first
                 if await loc.count() > 0 and await loc.is_visible():
                     await loc.click(timeout=4000)
-                    # Wait for possible navigation or DOM update
                     try:
                         await self.page.wait_for_load_state("domcontentloaded", timeout=4000)
                     except Exception:
@@ -509,6 +543,83 @@ class BrowserWrapper:
             r'no account found)\b',
             text
         ))
+
+    async def click_row_action(self, row_text: str, action: str = "delete"):
+        """Click a delete or edit icon button in a table row containing row_text.
+
+        Handles OrangeHRM-style tables ([role='row']) as well as plain <tr> rows.
+        For OrangeHRM: delete button has bi-trash class, edit has bi-pencil-fill.
+        Falls back to button position: edit=first button, delete=last button in row.
+        """
+        action_lower = action.lower()
+        delete_hints = ["bi-trash", "trash", "delete", "remove", "fa-trash",
+                        "icon-delete", "btn-delete", "action-delete"]
+        edit_hints   = ["bi-pencil", "pencil", "edit", "modify", "fa-edit",
+                        "fa-pencil", "icon-edit", "btn-edit", "action-edit"]
+        hints = delete_hints if action_lower == "delete" else edit_hints
+
+        row_selectors = [
+            f"[role='row']:has-text('{row_text}')",
+            f"tr:has-text('{row_text}')",
+            f"[class*='row']:has-text('{row_text}')",
+            f"li:has-text('{row_text}')",
+        ]
+
+        row_loc = None
+        for sel in row_selectors:
+            try:
+                loc = self.page.locator(sel).first
+                if await loc.count() > 0 and await loc.is_visible():
+                    row_loc = loc
+                    break
+            except Exception:
+                continue
+
+        if not row_loc:
+            logger.debug("Row containing '%s' not found — skipped.", row_text)
+            return
+
+        # Try icon class hints inside the row
+        for hint in hints:
+            for btn_sel in (f"[class*='{hint}']", f"button i[class*='{hint}']"):
+                try:
+                    el = row_loc.locator(btn_sel).first
+                    if await el.count() > 0:
+                        # The clickable target is the button wrapping the icon
+                        clickable = row_loc.locator(
+                            f"button:has([class*='{hint}']), [role='button']:has([class*='{hint}'])"
+                        ).first
+                        if await clickable.count() == 0:
+                            clickable = el  # click the icon itself if no wrapper found
+                        if await clickable.is_visible():
+                            await clickable.click(timeout=4000)
+                            try:
+                                await self.page.wait_for_load_state("domcontentloaded", timeout=4000)
+                            except Exception:
+                                pass
+                            await asyncio.sleep(0.8)
+                            return
+                except Exception:
+                    continue
+
+        # Fallback: positional — buttons in the row (edit=first, delete=last)
+        try:
+            buttons = row_loc.locator("button, [role='button']")
+            count = await buttons.count()
+            if count > 0:
+                target_btn = buttons.nth(count - 1) if action_lower == "delete" else buttons.first
+                if await target_btn.is_visible():
+                    await target_btn.click(timeout=4000)
+                    try:
+                        await self.page.wait_for_load_state("domcontentloaded", timeout=4000)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.8)
+                    return
+        except Exception:
+            pass
+
+        logger.debug("Action '%s' not found in row '%s' — skipped.", action, row_text)
 
     async def close(self):
         for obj, method in (

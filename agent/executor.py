@@ -154,6 +154,13 @@ class Executor:
                         await self.browser.click_element(target)
                         await self.browser.wait_for_load()
 
+                elif action == "click_row_action":
+                    row_text = step.get("row") or step.get("field") or step.get("text") or ""
+                    act      = (step.get("value") or "delete").lower()
+                    if row_text:
+                        await self.browser.click_row_action(row_text, act)
+                        await self.browser.wait_for_load()
+
                 elif action == "select":
                     field = step.get("field")
                     value = step.get("value") or ""
@@ -174,12 +181,14 @@ class Executor:
                 elif action == "verify_text":
                     text = step.get("value") or step.get("text") or ""
                     if text:
-                        found = False
-                        for _ in range(6):
-                            found = await self.browser.page_contains_text(text)
-                            if found:
-                                break
-                            await asyncio.sleep(0.5)
+                        found = await self.browser.page_contains_text(text)
+                        if not found:
+                            # Give the page up to 2s to settle (e.g. async redirect)
+                            for _ in range(4):
+                                await asyncio.sleep(0.5)
+                                found = await self.browser.page_contains_text(text)
+                                if found:
+                                    break
                         if not found:
                             text_lower = text.lower()
                             # Keywords that signal the step is checking for an error state
@@ -248,37 +257,29 @@ class Executor:
                 elif action == "screenshot":
                     name = step.get("value") or step.get("text") or f"{tc_id}_step{i+1}"
                     sr["screenshot"] = await self.browser.take_screenshot(name)
-                    # Skip the generic post-step screenshot since we just took one
                     step_results.append(sr)
-                    await asyncio.sleep(0.2)
                     continue
 
                 elif action == "describe":
                     pass  # narrative plan-only step — no live action
 
-                # Screenshot after every executed step
-                try:
-                    sr["screenshot"] = await self.browser.take_screenshot(
-                        f"step_{tc_id}_{i + 1}_{action}"
-                    )
-                except Exception:
-                    pass
+                # No screenshot on passing steps — only failures and final result matter
 
             except Exception as step_err:
                 sr["status"] = "failed"
                 sr["error"]  = str(step_err)
                 any_step_failed = True
                 logger.warning("Step %d (%s) failed in %s: %s", i + 1, action, tc_id, step_err)
+                # Capture the failure state so the report shows what went wrong
                 try:
                     sr["screenshot"] = await self.browser.take_screenshot(
-                        f"step_err_{tc_id}_{i + 1}"
+                        f"fail_{tc_id}_step{i + 1}"
                     )
                 except Exception:
                     pass
                 # Continue to next step — do not abort
 
             step_results.append(sr)
-            await asyncio.sleep(0.2)
 
         # ── Auto-submit when fill steps exist but no explicit terminal action ─
         if has_fill_step and not has_explicit_submit:
@@ -820,21 +821,53 @@ def _compute_overall(matrix: dict) -> None:
 
 
 async def run_all_browsers_multi_page(
-    url_tc_pairs: list,
-    browsers:     list,
+    url_tc_pairs:  list,
+    browsers:      list,
     emit_fn=None,
+    credentials:   dict | None = None,
+    login_url:     str | None = None,
 ) -> dict:
     """Run (url, test_case) pairs on every browser in parallel.
 
     Each browser opens one session and executes all pairs sequentially.
+    If credentials + login_url are provided, the browser authenticates
+    before the first test so protected pages are accessible throughout.
     Returns a result matrix keyed by test ID.
     """
+    async def _pre_authenticate(bw: BrowserWrapper, creds: dict, url: str) -> bool:
+        """Login once so the entire spec test sequence runs authenticated."""
+        try:
+            await bw.open_page(url)
+            inputs = await bw.extract_inputs()
+            for f in inputs:
+                fid   = (f.get("id") or f.get("name") or "").lower()
+                ftype = (f.get("type") or "").lower()
+                ident = f.get("id") or f.get("name") or ftype
+                if any(k in fid for k in ("user", "email", "login", "name")) or ftype in ("text", "email"):
+                    await bw.fill_field(ident, creds["username"])
+                elif ftype == "password":
+                    await bw.fill_field(ident, creds["password"])
+            await bw.click_submit()
+            try:
+                await bw.page.wait_for_load_state("networkidle", timeout=6000)
+            except Exception:
+                pass
+            await asyncio.sleep(1)
+            logger.info("Pre-auth: logged in as '%s' for spec test run.", creds.get("username"))
+            return True
+        except Exception as exc:
+            logger.warning("Pre-auth failed: %s — tests will run unauthenticated.", exc)
+            return False
+
     async def _run_browser(browser_name: str) -> list:
         bw = BrowserWrapper()
         ex = Executor(bw)
         results = []
         try:
             await bw.start(browser_name)
+            # Pre-authenticate once so all tests share an authenticated session
+            if credentials and login_url:
+                await _pre_authenticate(bw, credentials, login_url)
             for target_url, tc in url_tc_pairs:
                 try:
                     result = await asyncio.wait_for(ex.execute(tc, target_url), timeout=45)
