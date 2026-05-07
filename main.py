@@ -171,21 +171,6 @@ def _normalize_url(url: str) -> str:
     return url
 
 
-@app.post("/api/run-agent")
-async def run_agent(
-    url: str = Form(...),
-    browsers: str = Form(default="chromium"),
-):
-    url = _normalize_url(url)
-    if not url:
-        raise HTTPException(status_code=400, detail="Missing url")
-    browser_list = [b.strip() for b in browsers.split(",") if b.strip()] or ["chromium"]
-    agent = CoreAgent()
-    try:
-        return await agent.run_multi_browser(url, browser_list, emit_fn=_broadcast_event)
-    finally:
-        _broadcast_done()
-
 
 @app.post("/api/run-agent-with-spec")
 async def run_agent_with_spec(
@@ -257,17 +242,12 @@ async def generate_report_only(
     browser_list = [b.strip() for b in browsers.split(",") if b.strip()] or ["chromium"]
     agent = CoreAgent()
     try:
-        if has_file:
-            content   = await spec_file.read()
-            spec_text = extract_spec_text(content, spec_file.filename)
-            print(f"[SPEC] Loaded '{spec_file.filename}' — {len(spec_text)} chars")
-            data = await agent.run_multi_browser_with_spec(
-                _normalize_url(url), spec_text, browser_list, emit_fn=_broadcast_event
-            )
-        else:
-            data = await agent.run_multi_browser(
-                _normalize_url(url), browser_list, emit_fn=_broadcast_event
-            )
+        content   = await spec_file.read()
+        spec_text = extract_spec_text(content, spec_file.filename)
+        print(f"[SPEC] Loaded '{spec_file.filename}' — {len(spec_text)} chars")
+        data = await agent.run_multi_browser_with_spec(
+            _normalize_url(url), spec_text, browser_list, emit_fn=_broadcast_event
+        )
 
         browser   = browser_list[0] if len(browser_list) == 1 else "multi"
         word_path = generate_word_report(data, browser=browser)

@@ -27,32 +27,15 @@
       <div class="card" style="margin-bottom:1rem">
         <div class="card-header">Source de Test</div>
         <div class="card-body">
-          <div class="tab-bar">
-            <div class="tab active" data-tab="url">URL</div>
-            <div class="tab" data-tab="spec">Fichier Spec</div>
+          <div class="drop-zone" id="drop-zone">
+            <div class="drop-zone-icon">+</div>
+            <div>Glisser-d&eacute;poser un fichier .md, .txt ou .pdf</div>
+            <div style="font-size:0.75rem;margin-top:0.3rem">ou cliquer pour parcourir</div>
+            <input type="file" id="spec-file" accept=".md,.txt,.pdf,.sfd" style="display:none">
           </div>
-
-          <!-- URL tab -->
-          <div id="tab-url">
-            <div class="form-group">
-              <label class="form-label">URL cible</label>
-              <input type="url" id="target-url" class="form-input"
-                     placeholder="https://exemple.com/login">
-            </div>
-          </div>
-
-          <!-- Spec tab -->
-          <div id="tab-spec" style="display:none">
-            <div class="drop-zone" id="drop-zone">
-              <div class="drop-zone-icon">+</div>
-              <div>Glisser-d&eacute;poser un fichier .md, .txt ou .pdf</div>
-              <div style="font-size:0.75rem;margin-top:0.3rem">ou cliquer pour parcourir</div>
-              <input type="file" id="spec-file" accept=".md,.txt,.pdf,.sfd" style="display:none">
-            </div>
-            <div id="spec-filename" style="font-size:0.8rem;color:var(--accent);margin-top:0.5rem;min-height:1.2em"></div>
-            <div class="form-group" style="margin-top:0.75rem">
-              <input type="url" id="spec-url" class="form-input" placeholder="https://...">
-            </div>
+          <div id="spec-filename" style="font-size:0.8rem;color:var(--accent);margin-top:0.5rem;min-height:1.2em"></div>
+          <div class="form-group" style="margin-top:0.75rem">
+            <input type="url" id="spec-url" class="form-input" placeholder="https://...">
           </div>
         </div>
       </div>
@@ -70,12 +53,6 @@
             </label>
             <label class="browser-option" data-browser="webkit">
               <span class="browser-check"></span>WebKit
-            </label>
-            <label class="browser-option" data-browser="chrome">
-              <span class="browser-check"></span>Chrome
-            </label>
-            <label class="browser-option" data-browser="edge">
-              <span class="browser-check"></span>Edge
             </label>
           </div>
           <div style="display:flex;justify-content:space-between;align-items:center;margin-top:0.6rem">

@@ -485,20 +485,30 @@ class BrowserWrapper:
             "[role='status']",
             "[class*='snackbar' i]",
         ]
-        for sel in success_selectors:
-            try:
-                loc = self.page.locator(sel)
-                if await loc.count() > 0 and await loc.first.is_visible():
-                    return True
-            except Exception:
-                continue
-        text = (await self.page.locator("body").inner_text()).lower()
-        return bool(re.search(
+        _success_re = re.compile(
             r'\b(successfully|success|saved|created|added|deleted|removed|updated|'
             r'modifi[eé]|ajout[eé]|supprim[eé]|enregistr[eé]|cr[eé][eé]|'
             r'mis à jour|opération réussie|changement sauvegardé)\b',
-            text
-        ))
+            re.IGNORECASE,
+        )
+        for sel in success_selectors:
+            try:
+                loc = self.page.locator(sel)
+                if await loc.count() > 0:
+                    # Visible toast — immediate pass
+                    if await loc.first.is_visible():
+                        return True
+                    # Faded/hidden toast still in DOM (e.g. OrangeHRM oxd-toast) — check text
+                    try:
+                        txt = await loc.first.inner_text()
+                        if _success_re.search(txt):
+                            return True
+                    except Exception:
+                        pass
+            except Exception:
+                continue
+        text = (await self.page.locator("body").inner_text()).lower()
+        return bool(_success_re.search(text))
 
     async def page_contains_text(self, text: str) -> bool:
         """Check if the given text (case-insensitive) appears anywhere on the page."""

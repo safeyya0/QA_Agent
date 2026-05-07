@@ -265,10 +265,12 @@ def _get_all_results(report_data: dict) -> list:
                 "type":        tc.get("type", "standard"),
                 "overall":     status,
                 "browsers_list": [{
-                    "browser":    browsers_reported[0] if browsers_reported else "chromium",
-                    "status":     status,
-                    "error":      r.get("error") or "",
-                    "screenshot": r.get("screenshot") or "",
+                    "browser":                    browsers_reported[0] if browsers_reported else "chromium",
+                    "status":                     status,
+                    "error":                      r.get("error") or "",
+                    "screenshot":                 r.get("screenshot") or "",
+                    "primary_screenshot":         r.get("primary_screenshot") or "",
+                    "primary_screenshot_context": r.get("primary_screenshot_context"),
                 }],
                 "auth_steps":  r.get("steps", []),
                 "credentials": r.get("credentials_used"),
@@ -288,10 +290,12 @@ def _get_all_results(report_data: dict) -> list:
                 "overall":     data.get("overall", "UNKNOWN"),
                 "browsers_list": [
                     {
-                        "browser":    b,
-                        "status":     bd.get("status", "UNKNOWN"),
-                        "error":      bd.get("error") or "",
-                        "screenshot": bd.get("screenshot") or "",
+                        "browser":                    b,
+                        "status":                     bd.get("status", "UNKNOWN"),
+                        "error":                      bd.get("error") or "",
+                        "screenshot":                 bd.get("screenshot") or "",
+                        "primary_screenshot":         bd.get("primary_screenshot") or "",
+                        "primary_screenshot_context": bd.get("primary_screenshot_context"),
                     }
                     for b, bd in data.get("browsers", {}).items()
                 ],
@@ -439,19 +443,18 @@ def _intro(doc, url, date_fr, browsers_str):
 
     _subsection(doc, "1.3  Périmètre des tests")
     _para(doc,
-        "Les tests ont été générés et exécutés de manière entièrement automatisée, "
-        "couvrant les formulaires détectés sur la page cible. Le périmètre inclut les "
-        "tests de validation des champs (formats, longueurs, caractères spéciaux), "
-        "les tests de sécurité applicative (injection SQL, Cross-Site Scripting), "
-        "les tests aux limites (valeurs minimales et maximales), les tests de flux "
-        "d'authentification complets (inscription, connexion, déconnexion) et les tests "
-        "de compatibilité multi-navigateurs lorsque plusieurs navigateurs sont sélectionnés.",
+        "Les tests ont été générés et exécutés de manière entièrement automatisée. "
+        "Le périmètre inclut les tests de validation des champs (formats, longueurs, "
+        "caractères spéciaux), les tests aux limites, les tests de flux d'authentification "
+        "complets (connexion valide, connexion invalide, déconnexion), les tests CRUD "
+        "(création, modification, suppression d'enregistrements) et les tests de compatibilité "
+        "multi-navigateurs lorsque plusieurs navigateurs sont sélectionnés.",
         size=9.5, color=C["slate"], before=2, after=4)
 
     scope_data = [
         ("Dans le périmètre",
-         "Validation des champs · Gestion des erreurs · Flux d'authentification · "
-         "Tests négatifs (SQL injection, XSS) · Compatibilité navigateurs"),
+         "Authentification · Validation des champs · Tests CRUD · "
+         "Tests négatifs (mauvais identifiants, champs vides) · Compatibilité navigateurs"),
         ("Hors périmètre",
          "Tests de performance · Tests de charge · Accessibilité WCAG · "
          "Tests API back-end · Tests d'intégration système"),
@@ -656,11 +659,11 @@ def _methodology(doc):
 
     _subsection(doc, "4.2  Catégories de tests couverts")
     cats = [
-        ("Tests de validation",      "Champs vides, formats invalides (email, téléphone), longueurs extrêmes (> 200 caractères), caractères spéciaux et encodages inhabituels."),
-        ("Tests de sécurité",        "Injection SQL (OR '1'='1', UNION SELECT), Cross-Site Scripting (balises <script>, onerror), traversées de répertoires, entrées nullbytes."),
-        ("Tests aux limites",        "Valeurs minimales et maximales, espaces seuls, chaînes vides, chaînes de longueur maximale, caractères Unicode."),
-        ("Tests négatifs",           "Identifiants erronés, mots de passe incorrects, emails inexistants, combinaisons invalides multiples simultanées."),
-        ("Tests d'authentification", "Inscription automatique, vérification du compte créé, connexion avec identifiants valides, connexion invalide, déconnexion complète."),
+        ("Tests d'authentification", "Connexion avec identifiants valides, connexion invalide (mauvais mot de passe, champs vides), déconnexion complète."),
+        ("Tests de validation",      "Champs vides, formats invalides, longueurs extrêmes (> 200 caractères), caractères spéciaux et encodages inhabituels."),
+        ("Tests aux limites",        "Valeurs minimales et maximales, espaces seuls, chaînes vides, caractères Unicode."),
+        ("Tests négatifs",           "Identifiants erronés, mots de passe incorrects, combinaisons invalides multiples simultanées."),
+        ("Tests CRUD",               "Création, modification et suppression d'enregistrements (employés, utilisateurs, congés) via l'interface."),
         ("Tests de compatibilité",   "Exécution parallèle sur Chromium, Firefox, WebKit, Chrome, Edge pour détecter les incohérences de rendu."),
     ]
     cat_tbl = doc.add_table(rows=len(cats), cols=2)
@@ -689,10 +692,9 @@ def _methodology(doc):
         size=9.5, color=C["slate"], before=2, after=4)
 
     _para(doc,
-        "Les tests de sécurité injectent des vecteurs d'attaque standardisés directement dans "
-        "les champs de formulaire pour vérifier que l'application les filtre et les rejette "
-        "correctement. Tout test de sécurité détectant une absence de validation côté client "
-        "ou serveur est automatiquement classé CRITIQUE dans le rapport.",
+        "Pour les tests CRUD, l'agent localise les lignes dans les tableaux par texte visible "
+        "et clique les icônes d'action (corbeille pour suppression, crayon pour modification). "
+        "Tout comportement non conforme détecté est automatiquement classé par sévérité dans le rapport.",
         size=9.5, color=C["slate"], before=2, after=8)
 
 
@@ -708,6 +710,15 @@ def _test_card(doc, res: dict, index: int, seen_screenshots: set) -> None:
     label          = STATUS_FR.get(overall, overall)
     sev, sev_color = _severity(overall, res.get("description", ""), res.get("expected", ""))
     is_auth        = res.get("type") == "auth_flow"
+    browsers_list  = res.get("browsers_list", [])
+
+    # Collect actual step-level results (needed in sections 3 and 6)
+    exec_results = next(
+        (bl.get("step_results", []) for bl in browsers_list if bl.get("step_results")),
+        []
+    )
+    exec_by_idx = {sr.get("step", i + 1): sr for i, sr in enumerate(exec_results)}
+    has_exec    = bool(exec_results)
 
     # ── 1. Header table (ID + description | status badge) ─────────────────────
     h_tbl = doc.add_table(rows=1, cols=2)
@@ -755,11 +766,13 @@ def _test_card(doc, res: dict, index: int, seen_screenshots: set) -> None:
         vr.font.size = Pt(8.5); vr.font.name = "Calibri"
         vr.font.color.rgb = _rgb(sev_color if ri == 2 else C["slate"])
 
-    # ── 3. Steps table — doc level ────────────────────────────────────────────
+    # ── 3. Steps table — show actual execution results ────────────────────────
     steps = res.get("steps", [])
+
     if steps and not is_auth:
         is_narrative = any(s.get("action") == "describe" for s in steps)
-        _subsection(doc, "Scénario narratif :" if is_narrative else "Étapes d'exécution :")
+        label = "Scénario narratif :" if is_narrative else "Étapes d'exécution (statut réel) :"
+        _subsection(doc, label)
 
         if is_narrative:
             for si, step in enumerate(steps, 1):
@@ -781,27 +794,57 @@ def _test_card(doc, res: dict, index: int, seen_screenshots: set) -> None:
                     vr2.font.size = Pt(8.5); vr2.font.name = "Calibri"
                     vr2.font.color.rgb = _rgb(C["slate"])
         else:
-            st_tbl = doc.add_table(rows=len(steps) + 1, cols=4)
+            ncols = 5 if has_exec else 4
+            hdrs  = ["#", "Action", "Champ / Cible", "Valeur"]
+            if has_exec:
+                hdrs.append("Résultat")
+
+            st_tbl = doc.add_table(rows=len(steps) + 1, cols=ncols)
             st_tbl.style = "Table Grid"
-            for ci, hdr in enumerate(["#", "Action", "Champ / Cible", "Valeur"]):
+            for ci, hdr in enumerate(hdrs):
                 c = st_tbl.rows[0].cells[ci]
                 _cell_bg(c, C["navy2"])
                 r = c.paragraphs[0].add_run(hdr)
                 r.bold = True; r.font.size = Pt(8); r.font.name = "Calibri"
                 r.font.color.rgb = _rgb(C["white"])
+
             for si, step in enumerate(steps, 1):
-                row = st_tbl.rows[si].cells
+                row    = st_tbl.rows[si].cells
+                ex     = exec_by_idx.get(si, {})
+                st_val = (ex.get("status") or "planned").upper()
+                st_bg  = STATUS_BG.get(st_val, C["light"]) if has_exec else C["white"]
+                st_fg  = STATUS_FG.get(st_val, C["muted"]) if has_exec else C["muted"]
+                st_lbl = STATUS_FR.get(st_val, st_val) if has_exec else "—"
+                err    = _safe(ex.get("error") or "")[:80]
+
                 _cell_bg(row[0], C["light"])
-                for ci2 in (1, 2, 3):
+                for ci2 in range(1, ncols):
                     _cell_bg(row[ci2], C["white"])
+
                 row[0].paragraphs[0].add_run(str(si)).font.size = Pt(8)
                 row[1].paragraphs[0].add_run(_safe(step.get("action", "—"))).font.size = Pt(8)
-                row[2].paragraphs[0].add_run(
-                    _safe(step.get("field") or step.get("text") or "—")
-                ).font.size = Pt(8)
-                row[3].paragraphs[0].add_run(
-                    _safe(step.get("value", "—"))[:80]
-                ).font.size = Pt(8)
+
+                # Champ / Cible: show row field for click_row_action
+                field_val = (
+                    step.get("row") or step.get("field") or
+                    step.get("text") or step.get("selector") or "—"
+                )
+                row[2].paragraphs[0].add_run(_safe(field_val)[:60]).font.size = Pt(8)
+                row[3].paragraphs[0].add_run(_safe(step.get("value", "—"))[:60]).font.size = Pt(8)
+
+                if has_exec:
+                    _cell_bg(row[4], st_bg)
+                    sr_p = row[4].paragraphs[0]
+                    sr_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    sr_run = sr_p.add_run(st_lbl)
+                    sr_run.bold = True; sr_run.font.size = Pt(7.5); sr_run.font.name = "Calibri"
+                    sr_run.font.color.rgb = _rgb(st_fg)
+                    # Show error below if step failed
+                    if err and st_val == "FAILED":
+                        ep = row[4].add_paragraph()
+                        er2 = ep.add_run(err)
+                        er2.font.size = Pt(7); er2.italic = True
+                        er2.font.color.rgb = _rgb(C["danger"])
         doc.add_paragraph()
 
     # ── 4. Auth sub-steps table — doc level ───────────────────────────────────
@@ -836,7 +879,6 @@ def _test_card(doc, res: dict, index: int, seen_screenshots: set) -> None:
         doc.add_paragraph()
 
     # ── 5. Per-browser results table — doc level ──────────────────────────────
-    browsers_list = res.get("browsers_list", [])
     if browsers_list:
         _subsection(doc, "Résultats par navigateur :")
         bw_tbl = doc.add_table(rows=len(browsers_list) + 1, cols=3)
@@ -870,39 +912,71 @@ def _test_card(doc, res: dict, index: int, seen_screenshots: set) -> None:
     lr = result_p.add_run("Résultat obtenu : ")
     lr.bold = True; lr.font.size = Pt(8.5); lr.font.name = "Calibri"
     lr.font.color.rgb = _rgb(C["muted"])
-    result_text = (
-        "Test réussi — comportement conforme au résultat attendu."
-        if overall == "PASSED"
-        else (
-            next(
-                (bl.get("error") for bl in browsers_list if bl.get("error")),
-                None,
-            ) or "Voir détails ci-dessus"
-        )
-    )
+
+    if overall == "PASSED":
+        result_text = "Test réussi — comportement conforme au résultat attendu."
+        res_color   = C["success"]
+    elif overall == "PARTIAL":
+        # Find which specific steps failed
+        failed_steps = [
+            sr for sr in exec_results if (sr.get("status") or "").upper() == "FAILED"
+        ]
+        if failed_steps:
+            details = "; ".join(
+                f"step {s.get('step')} ({s.get('action','?')}): {(s.get('error') or '')[:80]}"
+                for s in failed_steps[:3]
+            )
+            result_text = f"Partiel — actions exécutées, vérification échouée. Détail : {details}"
+        else:
+            result_text = "Partiel — certaines étapes n'ont pas pu être vérifiées."
+        res_color = C["warning"]
+    else:
+        err_msg = next((bl.get("error") for bl in browsers_list if bl.get("error")), None)
+        result_text = err_msg[:150] if err_msg else "Test échoué — voir détails ci-dessus."
+        res_color = C["danger"]
+
     vr_res = result_p.add_run(result_text)
     vr_res.font.size  = Pt(8.5); vr_res.font.name = "Calibri"
     vr_res.italic     = overall != "PASSED"
-    vr_res.font.color.rgb = _rgb(C["success"] if overall == "PASSED" else C["danger"])
+    vr_res.font.color.rgb = _rgb(res_color)
 
-    # ── 7. Screenshot — deduplicated by path ──────────────────────────────────
-    screenshot = next(
-        (
-            bl["screenshot"]
-            for bl in browsers_list
-            if bl.get("screenshot")
-            and os.path.exists(bl["screenshot"])
-            and bl["screenshot"] not in seen_screenshots
-        ),
+    # ── 7. Screenshot — prefer primary_screenshot (semantically correct), deduplicated ──
+    # Try primary_screenshot first (failure point for FAILED/PARTIAL, final state for PASSED)
+    primary_bl = next(
+        (bl for bl in browsers_list
+         if bl.get("primary_screenshot")
+         and os.path.exists(bl["primary_screenshot"])
+         and bl["primary_screenshot"] not in seen_screenshots),
         None,
     )
+    if primary_bl:
+        screenshot = primary_bl["primary_screenshot"]
+        ctx        = primary_bl.get("primary_screenshot_context") or {}
+    else:
+        # Fallback: any screenshot not yet shown
+        fallback_bl = next(
+            (bl for bl in browsers_list
+             if bl.get("screenshot")
+             and os.path.exists(bl["screenshot"])
+             and bl["screenshot"] not in seen_screenshots),
+            None,
+        )
+        screenshot = fallback_bl["screenshot"] if fallback_bl else None
+        ctx        = {}
+
     if screenshot:
         seen_screenshots.add(screenshot)
         try:
             doc.add_picture(screenshot, width=Inches(5.5))
-            cap = doc.add_paragraph(
-                f"Figure — {res.get('id', '')} · {STATUS_FR.get(overall, overall)}"
-            )
+            ctx_label = ctx.get("label") or ""
+            if ctx_label:
+                cap_text = (
+                    f"Figure — {res.get('id', '')} · "
+                    f"{STATUS_FR.get(overall, overall)} — {ctx_label}"
+                )
+            else:
+                cap_text = f"Figure — {res.get('id', '')} · {STATUS_FR.get(overall, overall)}"
+            cap = doc.add_paragraph(cap_text)
             cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
             cap.runs[0].font.size = Pt(7.5)
             cap.runs[0].italic    = True
@@ -1272,24 +1346,28 @@ def generate_word_report(report_data: dict, browser: str = "chromium",
 
     raw_results = _get_all_results(report_data)
 
-    # Deduplicate by test ID — log a warning if duplicates were found
-    seen_ids:          set[str] = set()
-    results:           list     = []
-    seen_screenshots:  set[str] = set()   # passed to every _test_card call
+    # Deduplicate by test ID
+    seen_ids:         set[str] = set()
+    deduped:          list     = []
+    seen_screenshots: set[str] = set()
 
     for r in raw_results:
         tid = r.get("id", "?")
         if tid in seen_ids:
-            logger.warning("Duplicate test ID '%s' in report data — skipping duplicate.", tid)
+            logger.warning("Duplicate test ID '%s' — skipping.", tid)
             continue
         seen_ids.add(tid)
-        results.append(r)
+        deduped.append(r)
 
-    if len(results) != len(raw_results):
-        logger.warning(
-            "Removed %d duplicate(s) from report (%d raw → %d unique).",
-            len(raw_results) - len(results), len(raw_results), len(results),
-        )
+    # Sort sequentially: auth_flow first, then by numeric ID (TC-001, TC-002…)
+    def _sort_key(r):
+        tid = r.get("id", "")
+        if "auth_flow" in tid.lower():
+            return (0, 0, tid)
+        m = _re.search(r'\d+', tid)
+        return (1, int(m.group()) if m else 9999, tid)
+
+    results: list = sorted(deduped, key=_sort_key)
 
     failed_res = [r for r in results if r.get("overall") in ("FAILED", "PARTIAL")]
 

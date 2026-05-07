@@ -527,40 +527,41 @@ def convert_spec_scenarios_to_steps(
 
     url_ctx = f"Base URL: {url}\n" if url else ""
 
-    # ── Serialise all spec content ────────────────────────────────────────────
-    spec_content = ""
-
-    for i, sc in enumerate(scenarios, 1):
-        spec_content += f"\n=== Scenario {i} [{sc.get('id','')}]: {sc.get('description', '')}\n"
-        if sc.get("given"):
-            spec_content += "Given: " + "; ".join(sc["given"]) + "\n"
-        if sc.get("when"):
-            spec_content += "When: " + "; ".join(sc["when"]) + "\n"
-        if sc.get("then"):
-            spec_content += "Then: " + "; ".join(sc["then"]) + "\n"
-        # Table-parsed steps (field="action", value="step description")
-        for step in sc.get("steps", []):
-            spec_content += f"  Step: {step.get('value', '')}\n"
-        if sc.get("expected"):
-            spec_content += f"Expected: {sc['expected']}\n"
-        if sc.get("test_data"):
-            spec_content += f"Test data: {sc['test_data']}\n"
-
-    for req in requirements:
-        spec_content += f"\n=== Requirement {req['id']}: {req['text']}\n"
-
-    for story in user_stories:
-        spec_content += f"\n=== User Story: {story}\n"
-
-    # Free-text sections (no BDD structure — use as-is)
-    for sec in sections_raw:
-        if sec.get("content"):
-            spec_content += f"\n=== Section: {sec['title']}\n"
-            spec_content += "\n".join(sec["content"][:8]) + "\n"
+    # ── Spec content serialiser (reused per batch) ───────────────────────────
+    def _build_spec_content(batch_scenarios, batch_reqs, batch_stories, batch_secs):
+        content = ""
+        for i, sc in enumerate(batch_scenarios, 1):
+            content += f"\n=== Scenario {i} [{sc.get('id','')}]: {sc.get('description', '')}\n"
+            if sc.get("given"):
+                content += "Given: " + "; ".join(sc["given"]) + "\n"
+            if sc.get("when"):
+                content += "When: " + "; ".join(sc["when"]) + "\n"
+            if sc.get("then"):
+                content += "Then: " + "; ".join(sc["then"]) + "\n"
+            for step in sc.get("steps", []):
+                content += f"  Step: {step.get('value', '')}\n"
+            if sc.get("expected"):
+                content += f"Expected: {sc['expected']}\n"
+            if sc.get("test_data"):
+                content += f"Test data: {sc['test_data']}\n"
+        for req in batch_reqs:
+            content += f"\n=== Requirement {req['id']}: {req['text']}\n"
+        for story in batch_stories:
+            content += f"\n=== User Story: {story}\n"
+        for sec in batch_secs:
+            if sec.get("content"):
+                content += f"\n=== Section: {sec['title']}\n"
+                content += "\n".join(sec["content"][:8]) + "\n"
+        return content
 
     system_msg = (
         "You are a senior QA Engineer. Convert EACH scenario into an executable automated test case.\n\n"
-        "LANGUAGE RULE — CRITICAL:\n"
+        "LANGUE — RÈGLE ABSOLUE :\n"
+        "Les champs 'description' et 'expected' de chaque cas de test DOIVENT OBLIGATOIREMENT être "
+        "rédigés EN FRANÇAIS, quelle que soit la langue du fichier de spécification.\n"
+        "Les valeurs dans les étapes verify_text doivent correspondre au texte réel de l'interface "
+        "(qui peut être en français ou en anglais selon l'application).\n\n"
+        "LANGUAGE RULE — UI MAPPING:\n"
         "The spec file may be in French OR English. The application UI may also be in French OR English.\n"
         "You must map the INTENT of each spec step to the actual UI element, regardless of language.\n"
         "Use the 'App sections' list (real discovered names + hrefs) as the source of truth for navigation.\n"
@@ -589,9 +590,15 @@ def convert_spec_scenarios_to_steps(
         "   submit is MANDATORY before verify_text in any form scenario\n"
         "3. LOGOUT: click value matching 'Logout'/'Se déconnecter' (try user avatar/profile menu first)\n"
         "4. NAVIGATION: navigate with EXACT href from App sections, then verify_text with a page title visible on that page\n"
-        "5. verify_text: a short word/phrase genuinely visible on the target page\n"
-        "   Good: page titles, section headings, button labels already on the page\n"
-        "   Bad: invented confirmation phrases ('Employee Created', 'Leave Applied', 'Welcome')\n"
+        "5. verify_text: a short keyword (MAX 20 chars) that ACTUALLY appears on the page.\n"
+        "   NEVER use full sentences or long error messages — use the KEY WORD only.\n"
+        "   Examples: 'Products', 'Dashboard', 'Successfully', 'Login', 'required', 'Invalid', 'THANK YOU'.\n"
+        "   For OrangeHRM CRUD success: 'Successfully'. For login success: 'Dashboard'.\n"
+        "   For logout: 'Login'. For search results: 'Records Found'.\n"
+        "   For form validation errors: use only the key word, e.g. 'required' or 'Error'.\n"
+        "   FORBIDDEN in verify_text: full sentences, any invented person name (John Doe, Jane Smith),\n"
+        "   'Employee Created', 'Employee Deleted', 'Employee Updated', 'Leave Applied', 'Leave Approved',\n"
+        "   'Record Saved', 'Action Completed', 'Leave Balance', 'Leave History'.\n"
         "6. Use test_data values (Username/Password) from the scenario's 'Test data' field\n"
         "7. For navigate: ALWAYS use exact href from App sections — never invent URLs\n"
         "8. description ≤ 70 chars, expected ≤ 70 chars\n"
@@ -599,25 +606,80 @@ def convert_spec_scenarios_to_steps(
         "   The 'row' field must contain unique text visible in that row (e.g. the username).\n"
         "   Example — delete user FMLName: {\"action\":\"click_row_action\",\"row\":\"FMLName\",\"value\":\"delete\"}\n"
         "   Example — edit user FMLName:  {\"action\":\"click_row_action\",\"row\":\"FMLName\",\"value\":\"edit\"}\n"
-        "   NOTE: An admin user cannot delete itself — use a non-admin username in the 'row' field.\n\n"
+        "   NOTE: An admin user cannot delete itself — use a non-admin username in the 'row' field.\n"
+        "10. SEARCH / VIEW EMPLOYEE: NEVER invent employee names like 'John Doe' or 'Jane Smith'.\n"
+        "    To find an employee: navigate to PIM, do NOT fill the search field, click 'Search' directly\n"
+        "    (empty search shows all employees), then use click_row_action with value='edit' to open the first row.\n"
+        "    verify_text after opening employee: use 'Personal Details' (tab label visible on OrangeHRM employee page).\n"
+        "    ALSO FORBIDDEN in verify_text: 'John Doe', 'Jane Smith', any invented person name, 'Leave Balance',\n"
+        "    'Leave History', 'Employee Created', 'Employee Deleted', 'Employee Updated', 'Leave Applied'.\n"
+        "    For search results: verify_text value must be 'Records Found' (shown in OrangeHRM table after search).\n"
+        "11. LOGOUT: After clicking logout, verify_text 'Login' (the login page always shows 'Login' as heading).\n"
+        "12. MULTI-STEP CHECKOUT (e.g. SauceDemo): Checkout has TWO required buttons:\n"
+        "    - 'Continue' validates shipping info and goes to Order Overview page\n"
+        "    - 'Finish' completes the order and shows the confirmation/thank-you page\n"
+        "    ALWAYS generate BOTH clicks as separate steps: click 'Continue' THEN click 'Finish'.\n"
+        "    Without clicking Finish, the confirmation never appears. verify_text after Finish: 'THANK YOU'\n"
+        "    Checkout step order: navigate to cart → click 'Checkout' → fill form → click 'Continue' → click 'Finish' → verify_text 'THANK YOU'\n"
+        "13. NEW TAB LINKS: Some links open in a new tab (e.g. 'About' in SauceDemo).\n"
+        "    After clicking such a link the browser context stays on the CURRENT page.\n"
+        "    verify_text must reference text visible on the CURRENT page — not the new tab.\n"
+        "    Example: After clicking 'About' (opens saucelabs.com in new tab), verify_text 'Swag Labs'\n"
+        "    (the heading still visible on the SauceDemo inventory page you never left).\n"
+        "14. FORBIDDEN verify_text values: single digits ('1', '2', '3') and bare numbers.\n"
+        "    Use meaningful visible text instead:\n"
+        "    - After adding an item to cart: verify_text 'Remove' (the button that replaces 'Add to cart')\n"
+        "    - After adding multiple items: verify_text 'Remove'\n"
+        "    - NEVER use a cart badge count ('1', '2') as verify_text.\n"
+        "15. RESET APP STATE (SauceDemo menu): After clicking Reset App State in the hamburger menu,\n"
+        "    the cart is cleared but the page stays on inventory. verify_text 'Products'\n"
+        "    (the inventory page heading is always 'Products' and always visible after reset).\n\n"
         "Return ONLY valid JSON:\n"
         '{"test_cases":[{"id":"TC001","description":"...","steps":[...],"expected":"..."}]}'
     )
 
-    human_msg = (
-        f"{url_ctx}{fields_ctx}{sections_ctx}\n"
-        f"Spec scenarios and requirements to convert:\n{spec_content}\n\n"
-        "Convert EVERY scenario above to an executable test case."
-    )
+    # ── Batched conversion — avoids output-token truncation ──────────────────
+    # Each LLM call handles at most BATCH_SIZE scenarios so the JSON output
+    # always fits within max_tokens=2500.
+    BATCH_SIZE = 10
+    all_results: list = []
 
-    msgs = [SystemMessage(content=system_msg), HumanMessage(content=human_msg)]
-    try:
-        result = _parse_json_array(_invoke(model, msgs), model, msgs)
-        logger.info("Converted %d spec scenarios to executable test cases.", len(result))
-        return result
-    except Exception as exc:
-        logger.warning("convert_spec_scenarios_to_steps failed (%s) — returning empty.", exc)
-        return []
+    # Split scenarios into batches; if none exist, run one empty batch (for requirements/stories only)
+    if scenarios:
+        batches = [scenarios[i : i + BATCH_SIZE] for i in range(0, len(scenarios), BATCH_SIZE)]
+    else:
+        batches = [[]]
+    for batch_idx, batch in enumerate(batches):
+        # Include requirements / stories / free-text only in the first batch
+        # (they provide global context once, not repeated every batch)
+        reqs_b    = requirements  if batch_idx == 0 else []
+        stories_b = user_stories  if batch_idx == 0 else []
+        secs_b    = sections_raw  if batch_idx == 0 else []
+
+        spec_content = _build_spec_content(batch, reqs_b, stories_b, secs_b)
+        human_msg = (
+            f"{url_ctx}{fields_ctx}{sections_ctx}\n"
+            f"Spec scenarios and requirements to convert:\n{spec_content}\n\n"
+            "Convert EVERY scenario above to an executable test case."
+        )
+        msgs = [SystemMessage(content=system_msg), HumanMessage(content=human_msg)]
+        try:
+            batch_result = _parse_json_array(_invoke(model, msgs), model, msgs)
+            logger.info(
+                "Batch %d/%d: converted %d/%d spec scenarios.",
+                batch_idx + 1, len(batches), len(batch_result), len(batch),
+            )
+            all_results.extend(batch_result)
+        except Exception as exc:
+            logger.warning("convert_spec batch %d failed (%s) — skipping.", batch_idx + 1, exc)
+
+        # Groq TPM cooldown between batches
+        if batch_idx < len(batches) - 1:
+            logger.info("Waiting 65s between batches (Groq TPM quota)…")
+            time.sleep(65)
+
+    logger.info("Converted %d spec scenarios total.", len(all_results))
+    return all_results
 
 
 def extract_spec_text(file_content: bytes, filename: str) -> str:

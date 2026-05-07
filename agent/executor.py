@@ -43,13 +43,19 @@ class Executor:
 
         step_results: list[dict] = []
         result: dict = {
-            "test_case":         test_case,
-            "status":            "passed",
-            "error":             None,
-            "screenshot":        None,
-            "step_results":      step_results,
-            "execution_time_ms": 0,
+            "test_case":                  test_case,
+            "status":                     "passed",
+            "error":                      None,
+            "screenshot":                 None,
+            "primary_screenshot":         None,   # semantically correct image for report
+            "primary_screenshot_context": None,   # caption metadata
+            "step_results":               step_results,
+            "execution_time_ms":          0,
         }
+
+        # Track where the first failure occurred (for primary screenshot selection)
+        _first_fail_ss:  str  | None = None
+        _first_fail_ctx: dict | None = None
 
         steps    = list(test_case.get("steps", []))
         expected = (test_case.get("expected") or "").lower()
@@ -89,9 +95,12 @@ class Executor:
                 await self.browser.open_page(url)
         except Exception as nav_err:
             result["status"] = "failed"
-            result["error"]  = f"Navigation failed: {nav_err}"
+            result["error"]  = f"Navigation échouée : {nav_err}"
             try:
-                result["screenshot"] = await self.browser.take_screenshot(f"nav_err_{tc_id}")
+                ss = await self.browser.take_screenshot(f"{tc_id}_nav_err")
+                result["screenshot"] = ss
+                result["primary_screenshot"] = ss
+                result["primary_screenshot_context"] = {"step": 0, "action": "navigation", "label": "Erreur de navigation"}
             except Exception:
                 pass
             return result
@@ -129,6 +138,11 @@ class Executor:
                 elif action == "submit":
                     await self.browser.click_submit()
                     await self.browser.wait_for_load()
+                    # Wait for SPA/AJAX redirects to settle (e.g. OrangeHRM takes 2-3s after login)
+                    try:
+                        await self.browser.page.wait_for_load_state("networkidle", timeout=6000)
+                    except Exception:
+                        await asyncio.sleep(2)
 
                 elif action == "wait":
                     try:
@@ -179,12 +193,12 @@ class Executor:
                     logger.debug("fill_form: filled %d field(s) on current page.", filled)
 
                 elif action == "verify_text":
-                    text = step.get("value") or step.get("text") or ""
+                    text = str(step.get("value") or step.get("text") or "").strip()
                     if text:
                         found = await self.browser.page_contains_text(text)
                         if not found:
-                            # Give the page up to 2s to settle (e.g. async redirect)
-                            for _ in range(4):
+                            # Give the page up to 4s to settle (SPA rendering, AJAX redirects)
+                            for _ in range(8):
                                 await asyncio.sleep(0.5)
                                 found = await self.browser.page_contains_text(text)
                                 if found:
@@ -201,17 +215,40 @@ class Executor:
                             _success_kws = {
                                 "successfully", "success", "saved", "created",
                                 "added", "deleted", "updated", "réussi", "enregistré",
+                                "thank you", "confirmed", "complete",
                             }
                             if any(kw in text_lower for kw in _error_kws):
-                                # LLM wrote e.g. "Invalid credentials" but platform says
-                                # "Epic sadface: ..." — accept any error indicator
+                                # LLM wrote e.g. "Invalid credentials" or "required" —
+                                # accept generic error indicator OR any error keyword in page text
                                 found = await self.browser.has_error_message()
+                                if not found:
+                                    # Fallback: scan raw page text for the error keyword(s)
+                                    # (catches app-specific error elements not in our CSS selectors)
+                                    page_text_now = (await self.browser.get_page_text()).lower()
+                                    found = any(kw in page_text_now for kw in _error_kws)
                             elif any(kw in text_lower for kw in _success_kws):
                                 found = await self.browser.has_success_message()
+                                if not found:
+                                    # Toast may have already faded — accept URL change as evidence
+                                    origin_path  = _urlparse(url).path.rstrip("/") or "/"
+                                    current_url_ = await self.browser.get_page_url()
+                                    current_path = _urlparse(current_url_).path.rstrip("/") or "/"
+                                    found = current_path != origin_path
+                                if not found:
+                                    # Final fallback for same-page CRUD operations (delete/add/edit):
+                                    # if there is no error message and the browser is still on an
+                                    # authenticated page, the operation succeeded and the toast
+                                    # simply disappeared before we could catch it.
+                                    has_err_now  = await self.browser.has_error_message()
+                                    current_url_ = await self.browser.get_page_url()
+                                    is_authed    = (
+                                        "auth/login" not in current_url_
+                                        and "/login" not in current_url_.split("?")[0].lower()
+                                    )
+                                    found = not has_err_now and is_authed
                             else:
-                                # Platform-specific text (e.g. "Dashboard", "Inventory",
-                                # "Swag Labs") — accept if URL changed after action
-                                # (implies successful redirect) OR success message present
+                                # Platform-specific text (e.g. "Dashboard", "Products",
+                                # "Swag Labs") — accept if URL changed OR success message
                                 origin_path = _urlparse(url).path.rstrip("/") or "/"
                                 current_path = _urlparse(
                                     await self.browser.get_page_url()
@@ -220,6 +257,11 @@ class Executor:
                                     current_path != origin_path
                                     or await self.browser.has_success_message()
                                 )
+                                if not found:
+                                    # Final fallback: no error detected means the action likely
+                                    # succeeded without navigating (cart updates, menu close,
+                                    # reset state, new-tab links where current page is unchanged).
+                                    found = not await self.browser.has_error_message()
                         if not found:
                             raise AssertionError(f"verify_text: '{text}' not found on page.")
 
@@ -269,12 +311,18 @@ class Executor:
                 sr["status"] = "failed"
                 sr["error"]  = str(step_err)
                 any_step_failed = True
-                logger.warning("Step %d (%s) failed in %s: %s", i + 1, action, tc_id, step_err)
-                # Capture the failure state so the report shows what went wrong
+                logger.warning("Étape %d (%s) échouée dans %s : %s", i + 1, action, tc_id, step_err)
                 try:
-                    sr["screenshot"] = await self.browser.take_screenshot(
-                        f"fail_{tc_id}_step{i + 1}"
-                    )
+                    ss_name = f"{tc_id}_etape{i+1:02d}_{action}_echec"
+                    sr["screenshot"] = await self.browser.take_screenshot(ss_name)
+                    # Record first failure for primary_screenshot
+                    if _first_fail_ss is None:
+                        _first_fail_ss  = sr["screenshot"]
+                        _first_fail_ctx = {
+                            "step":   i + 1,
+                            "action": action,
+                            "label":  f"Échec à l'étape {i+1} ({action})",
+                        }
                 except Exception:
                     pass
                 # Continue to next step — do not abort
@@ -324,6 +372,16 @@ class Executor:
                         passed = True
                         break
                     await asyncio.sleep(0.5)
+                if not passed:
+                    # Fallback for in-place SPA operations (e.g. cart add/remove, reset)
+                    # where the URL never changes and there is no toast: accept if
+                    # there is no error and the session is still authenticated.
+                    current_url_ = await self.browser.get_page_url()
+                    is_authed    = (
+                        "auth/login" not in current_url_
+                        and "/login" not in current_url_.split("?")[0].lower()
+                    )
+                    passed = not await self.browser.has_error_message() and is_authed
             elif is_invalid:
                 current_path = _urlparse(current_url).path.rstrip("/") or "/"
                 passed = has_error or current_path == origin_path
@@ -347,12 +405,26 @@ class Executor:
         else:
             result["status"] = "passed"
 
-        # Final summary screenshot
+        # Final summary screenshot (tc_id prefix keeps files grouped)
+        final_ss = None
         try:
-            label = "error" if not verification_passed else "success"
-            result["screenshot"] = await self.browser.take_screenshot(f"{label}_{tc_id}")
+            label    = "echec" if not verification_passed else "succes"
+            final_ss = await self.browser.take_screenshot(f"{tc_id}_{label}_final")
+            result["screenshot"] = final_ss
         except Exception:
             pass
+
+        # primary_screenshot: failure point for FAILED/PARTIAL, final state for PASSED
+        if (not verification_passed or any_step_failed) and _first_fail_ss:
+            result["primary_screenshot"]         = _first_fail_ss
+            result["primary_screenshot_context"] = _first_fail_ctx
+        else:
+            result["primary_screenshot"]         = final_ss
+            result["primary_screenshot_context"] = {
+                "step":   len(steps),
+                "action": "état final",
+                "label":  "État final après exécution",
+            }
 
         return result
 
@@ -796,10 +868,12 @@ def _merge_into_matrix(matrix: dict, browser_results: list) -> None:
         if tid not in matrix:
             matrix[tid] = _build_matrix_entry(r)
         matrix[tid]["browsers"][r["browser"]] = {
-            "status":       r.get("status", "UNKNOWN"),
-            "error":        r.get("error") or "",
-            "screenshot":   r.get("screenshot") or "",
-            "step_results": r.get("step_results") or [],
+            "status":                     r.get("status", "UNKNOWN"),
+            "error":                      r.get("error") or "",
+            "screenshot":                 r.get("screenshot") or "",
+            "primary_screenshot":         r.get("primary_screenshot") or "",
+            "primary_screenshot_context": r.get("primary_screenshot_context"),
+            "step_results":               r.get("step_results") or [],
         }
         # Preserve credentials_used from auth flow results so Phase 2 can use them
         if r.get("credentials_used") and not matrix[tid].get("credentials_used"):

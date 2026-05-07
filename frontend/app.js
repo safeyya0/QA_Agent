@@ -10,17 +10,6 @@ document.addEventListener('DOMContentLoaded', () => {
   loadRuns();
 });
 
-// ── Tab switching ──────────────────────────────────────────────────────────
-document.querySelectorAll('.tab').forEach(tab => {
-  tab.addEventListener('click', () => {
-    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-    tab.classList.add('active');
-    const isSpec = tab.dataset.tab === 'spec';
-    document.getElementById('tab-url').style.display  = isSpec ? 'none'  : 'block';
-    document.getElementById('tab-spec').style.display = isSpec ? 'block' : 'none';
-    // Browser selection stays visible in both modes
-  });
-});
 
 // ── Browser selection ──────────────────────────────────────────────────────
 document.querySelectorAll('.browser-option').forEach(opt => {
@@ -153,7 +142,6 @@ function updateProgress(data) {
 
 // ── Start agent ────────────────────────────────────────────────────────────
 async function startAgent() {
-  const activeTab = document.querySelector('.tab.active').dataset.tab;
   const browsers = selectedBrowsers;
   if (browsers.length === 0) {
     alert('Sélectionnez au moins un navigateur.');
@@ -180,23 +168,14 @@ async function startAgent() {
 
   let response;
   try {
-    if (activeTab === 'url') {
-      const url = document.getElementById('target-url').value.trim();
-      if (!url) { alert('Entrez une URL.'); resetUI(); return; }
-      const formData = new FormData();
-      formData.append('url', url);
-      formData.append('browsers', browsers.join(','));
-      response = await fetch('/api/run-agent', { method: 'POST', body: formData });
-    } else {
-      const file = fileInput.files[0];
-      const specUrl = document.getElementById('spec-url').value.trim();
-      if (!file && !specUrl) { alert('Fournissez un fichier spec ou une URL.'); resetUI(); return; }
-      const formData = new FormData();
-      if (file) formData.append('spec_file', file);
-      formData.append('url', specUrl || '');
-      formData.append('browsers', browsers.join(','));
-      response = await fetch('/api/run-agent-with-spec', { method: 'POST', body: formData });
-    }
+    const file = fileInput.files[0];
+    const specUrl = document.getElementById('spec-url').value.trim();
+    if (!file && !specUrl) { alert('Fournissez un fichier spec et/ou une URL.'); resetUI(); return; }
+    const formData = new FormData();
+    if (file) formData.append('spec_file', file);
+    formData.append('url', specUrl || '');
+    formData.append('browsers', browsers.join(','));
+    response = await fetch('/api/run-agent-with-spec', { method: 'POST', body: formData });
 
     if (!response.ok) {
       const err = await response.json().catch(() => ({ detail: response.statusText }));
