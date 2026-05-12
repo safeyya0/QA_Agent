@@ -10,28 +10,37 @@ import glob
 import logging
 import builtins
 from datetime import datetime
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, StreamingResponse
 
+load_dotenv()
+
+from contextlib import asynccontextmanager
 from agent.core_agent import CoreAgent
 from tools.llm import extract_spec_text
 from tools.trello import is_configured as trello_configured
 from tools.word_report import generate_word_report
 from tools.mission_control import run_worker as mc_run_worker
 
-app = FastAPI(title="OMNISHORE QA Agent")
-
-os.makedirs("output", exist_ok=True)
-app.mount("/static", StaticFiles(directory="frontend"), name="static")
-
 _mc_enabled = bool(os.getenv("MISSION_CONTROL_URL"))
 
 
-@app.on_event("startup")
-async def _start_mc_worker():
+@asynccontextmanager
+async def lifespan(app):
     if _mc_enabled:
+        print(f"[MC Bridge] Connecting to {os.getenv('MISSION_CONTROL_URL')} ...")
         asyncio.create_task(mc_run_worker(CoreAgent()))
+    else:
+        print("[MC Bridge] Disabled — MISSION_CONTROL_URL not set.")
+    yield
+
+
+app = FastAPI(title="OMNISHORE QA Agent", lifespan=lifespan)
+
+os.makedirs("output", exist_ok=True)
+app.mount("/static", StaticFiles(directory="frontend"), name="static")
 
 
 # ── Live log streaming ────────────────────────────────────────────────────────
