@@ -165,6 +165,32 @@ class BrowserWrapper:
             "row_count":    row_count,
         }
 
+    async def _click_autocomplete_suggestion(self) -> bool:
+        """After typing into an autocomplete field, click the first visible suggestion.
+
+        Handles OrangeHRM Vue Select dropdowns and generic ARIA listboxes.
+        Returns True if a suggestion was clicked.
+        """
+        await asyncio.sleep(0.6)  # wait for dropdown to render
+        candidates = [
+            "[role='listbox'] [role='option']",
+            ".oxd-autocomplete-dropdown .oxd-autocomplete-option",
+            ".oxd-autocomplete-dropdown li",
+            "[class*='autocomplete-dropdown'] li",
+            "[class*='autocomplete-option']",
+            "[class*='suggestions'] li",
+            "[class*='dropdown-item']",
+        ]
+        for sel in candidates:
+            try:
+                loc = self.page.locator(sel)
+                if await loc.count() > 0 and await loc.first.is_visible(timeout=500):
+                    await loc.first.click()
+                    return True
+            except Exception:
+                continue
+        return False
+
     async def fill_field(self, field_identifier: str, value: str):
         selectors = [
             f"input[name='{field_identifier}']",
@@ -177,7 +203,46 @@ class BrowserWrapper:
         for sel in selectors:
             try:
                 if await self.page.locator(sel).count() > 0:
-                    await self.page.fill(sel, value, timeout=1000)
+                    loc = self.page.locator(sel).first
+                    # Detect autocomplete fields before typing (aria-autocomplete or combobox wrapper)
+                    is_autocomplete = False
+                    try:
+                        aria = await loc.get_attribute("aria-autocomplete", timeout=500)
+                        if aria:
+                            is_autocomplete = True
+                        if not is_autocomplete:
+                            is_autocomplete = await loc.evaluate(
+                                "el => !!(el.closest('[role=\"combobox\"]') || "
+                                "el.closest('.oxd-autocomplete-wrapper') || "
+                                "el.closest('[class*=\"autocomplete\"]'))"
+                            )
+                    except Exception:
+                        pass
+
+                    if is_autocomplete:
+                        # Typeahead field: fire real keystrokes so suggestions appear
+                        await loc.click(timeout=1000)
+                        await loc.fill("", timeout=1000)
+                        await loc.type(value, delay=40)
+                        clicked = await self._click_autocomplete_suggestion()
+                        if not clicked and value.strip():
+                            # Full value matched nothing — try shorter prefixes
+                            words = value.strip().split()
+                            fallbacks = []
+                            if len(words) > 1:
+                                fallbacks.append(words[0])
+                            if len(value) > 2:
+                                fallbacks.append(value[:2])
+                            fallbacks.append("a")
+                            for fb in fallbacks:
+                                await loc.fill("", timeout=500)
+                                await loc.type(fb, delay=40)
+                                clicked = await self._click_autocomplete_suggestion()
+                                if clicked:
+                                    break
+                    else:
+                        # Plain text / password field — direct fill, no autocomplete handling
+                        await self.page.fill(sel, value, timeout=1000)
                     return
             except Exception:
                 continue
@@ -519,7 +584,15 @@ class BrowserWrapper:
             return False
 
     async def has_error_message(self):
-        # Check for error UI elements first (most reliable)
+        # Pattern that must appear IN the element text for it to count as an error.
+        # This prevents success toasts (e.g. OrangeHRM "Successfully Logged In" with
+        # [role='alert']) from being mistaken for errors.
+        _error_content_re = re.compile(
+            r'\b(error|invalid|incorrect|wrong|failed|denied|unauthorized|rejected|'
+            r'required|missing|not found|forbidden|expired|locked|'
+            r'erreur|invalide|refus[eé]|obligatoire|introuvable|interdit|expiré|bloqué)\b',
+            re.IGNORECASE,
+        )
         error_selectors = [
             "[role='alert']",
             "[class*='error' i]",
@@ -535,9 +608,11 @@ class BrowserWrapper:
                 if await loc.count() > 0:
                     el = loc.first
                     if await el.is_visible():
-                        # Require actual text content — avoids false positives from empty styled divs
                         txt = (await el.inner_text()).strip()
-                        if txt and len(txt) > 2:
+                        # Must have real text AND contain error-related keywords.
+                        # Avoids false positives from: empty styled divs, success toasts
+                        # with [role='alert'], OrangeHRM notification badges, etc.
+                        if txt and len(txt) > 2 and _error_content_re.search(txt):
                             return True
             except Exception:
                 continue

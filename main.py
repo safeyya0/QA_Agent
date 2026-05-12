@@ -18,11 +18,20 @@ from agent.core_agent import CoreAgent
 from tools.llm import extract_spec_text
 from tools.trello import is_configured as trello_configured
 from tools.word_report import generate_word_report
+from tools.mission_control import run_worker as mc_run_worker
 
 app = FastAPI(title="OMNISHORE QA Agent")
 
 os.makedirs("output", exist_ok=True)
 app.mount("/static", StaticFiles(directory="frontend"), name="static")
+
+_mc_enabled = bool(os.getenv("MISSION_CONTROL_URL"))
+
+
+@app.on_event("startup")
+async def _start_mc_worker():
+    if _mc_enabled:
+        asyncio.create_task(mc_run_worker(CoreAgent()))
 
 
 # ── Live log streaming ────────────────────────────────────────────────────────
@@ -288,4 +297,4 @@ async def trello_test():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=False)
+    uvicorn.run("main:app", host="127.0.0.1", port=8002, reload=False)

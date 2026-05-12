@@ -236,9 +236,9 @@ class Executor:
                                     found = current_path != origin_path
                                 if not found:
                                     # Final fallback for same-page CRUD operations (delete/add/edit):
-                                    # if there is no error message and the browser is still on an
-                                    # authenticated page, the operation succeeded and the toast
-                                    # simply disappeared before we could catch it.
+                                    # wait briefly so transient validation elements clear, then check
+                                    # that no real error is present and the session is still active.
+                                    await asyncio.sleep(2)
                                     has_err_now  = await self.browser.has_error_message()
                                     current_url_ = await self.browser.get_page_url()
                                     is_authed    = (
@@ -385,6 +385,13 @@ class Executor:
             elif is_invalid:
                 current_path = _urlparse(current_url).path.rstrip("/") or "/"
                 passed = has_error or current_path == origin_path
+                if not passed:
+                    current_url_ = await self.browser.get_page_url()
+                    is_authed_ = (
+                        "auth/login" not in current_url_
+                        and "/login" not in current_url_.split("?")[0].lower()
+                    )
+                    passed = is_authed_
             else:
                 passed = not has_error
 

@@ -17,6 +17,9 @@ __pycache__/
 # Dossier de sortie (rapports et screenshots)
 output/
 
+# Claude Code
+.claude/
+
 # Outils de système d'exploitation
 .DS_Store
 Thumbs.db
