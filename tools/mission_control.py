@@ -130,22 +130,44 @@ async def disconnect() -> None:
 # ── 3. Poll heartbeat ─────────────────────────────────────────────────────────
 
 async def poll_assigned_tasks() -> list[dict]:
-    if not _heartbeat_url:
-        return []
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(_heartbeat_url, headers=_auth_headers())
-            resp.raise_for_status()
-            data = resp.json()
-        work_items = data.get("work_items") or []
-        tasks = []
-        for bucket in work_items:
-            if bucket.get("type") == "assigned_tasks":
-                tasks.extend(bucket.get("items") or [])
-        return tasks
-    except Exception as exc:
-        logger.debug("[MC Bridge] heartbeat error: %s", exc)
-        return []
+    """Poll heartbeat + fallback query for tasks failed by OpenClaw dispatch."""
+    tasks = []
+
+    # Primary: heartbeat work_items
+    if _heartbeat_url:
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(_heartbeat_url, headers=_auth_headers())
+                resp.raise_for_status()
+                data = resp.json()
+            for bucket in (data.get("work_items") or []):
+                if bucket.get("type") == "assigned_tasks":
+                    tasks.extend(bucket.get("items") or [])
+        except Exception as exc:
+            logger.debug("[MC Bridge] heartbeat error: %s", exc)
+
+    # Fallback: query tasks assigned to our agent that failed via OpenClaw dispatch
+    if _agent_id:
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(
+                    f"{MC_URL}/api/tasks",
+                    headers=_auth_headers(),
+                    params={"assignee": _agent_id, "status": "failed"},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            failed = data if isinstance(data, list) else (data.get("tasks") or [])
+            for t in failed:
+                # Only reclaim if failed by dispatch (not by us)
+                err = (t.get("result") or t.get("error") or "").lower()
+                if "openclaw" in err or "dispatch" in err or "enoent" in err or not err:
+                    if t not in tasks:
+                        tasks.append(t)
+        except Exception as exc:
+            logger.debug("[MC Bridge] failed-tasks query error: %s", exc)
+
+    return tasks
 
 
 # ── 4. Update task ─────────────────────────────────────────────────────────────
@@ -241,7 +263,7 @@ async def _execute_task(task: dict, core_agent) -> None:
         return
 
     print(f"[MC Bridge] Executing task {task_id} → url={url} browsers={browsers}")
-    await update_task(task_id, "running")
+    await update_task(task_id, "in_progress")
     try:
         from tools.word_report import generate_word_report
         result    = await core_agent.run_multi_browser_with_spec(url, spec, browsers)
@@ -249,15 +271,69 @@ async def _execute_task(task: dict, core_agent) -> None:
         browser   = b_list[0] if len(b_list) == 1 else "multi"
         word_path = generate_word_report(result, browser=browser)
         result["word_report"] = word_path
-        print(f"[MC Bridge] Word report → {word_path}")
-        await update_task(task_id, "completed", result)
+            # Find the matching JSON report (report_TIMESTAMP.json) for the download URL
+        import glob as _glob
+        json_files  = sorted(_glob.glob("output/report_*.json"), reverse=True)
+        json_report = os.path.basename(json_files[0]) if json_files else None
+        omnishore_url = os.getenv("OMNISHORE_URL", "http://localhost:8002")
+        if json_report:
+            download_url = f"{omnishore_url}/api/runs/{json_report}/export/word"
+            result["word_report"] = download_url
+            print(f"[MC Bridge] Word report → {download_url}")
+        else:
+            result["word_report"] = word_path
+        await update_task(task_id, "done", result)
         print(f"[MC Bridge] Task {task_id} completed.")
+        await _save_report_to_memory(task_id, url, result)
     except Exception as exc:
         print(f"[MC Bridge] Task {task_id} failed: {exc}")
         await update_task(task_id, "failed")
 
 
-# ── 7. Main worker ────────────────────────────────────────────────────────────
+# ── 7. Save report to Memory/Files ───────────────────────────────────────────
+
+async def _save_report_to_memory(task_id: int, url: str, result: dict) -> None:
+    """Save a markdown report summary to Mission Control Memory → Files."""
+    from datetime import datetime
+    ts       = datetime.now().strftime("%Y-%m-%d %H:%M")
+    word_url = result.get("word_report", "N/A")
+    content  = f"""# Rapport QA — Task {task_id}
+
+**Date :** {ts}
+**URL testée :** {url}
+
+## Résultats
+| Statut | Nombre |
+|--------|--------|
+| PASSED | {result.get('passed', 0)} |
+| FAILED | {result.get('failed', 0)} |
+| PARTIAL | {result.get('partial', 0)} |
+| **Total** | **{result.get('total_tests', 0)}** |
+
+## Télécharger le rapport Word
+
+[Cliquer ici pour télécharger le rapport Word]({word_url})
+"""
+    payload = {
+        "action":   "create",
+        "path":     f"reports/task_{task_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md",
+        "content":  content,
+        "agent":    "omnishore-qa",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                f"{MC_URL}/api/memory",
+                headers=_auth_headers(),
+                json=payload,
+            )
+            resp.raise_for_status()
+        print(f"[MC Bridge] Report saved to Memory/Files → {payload['path']}")
+    except Exception as exc:
+        logger.debug("[MC Bridge] memory save error: %s", exc)
+
+
+# ── 8. Main worker ────────────────────────────────────────────────────────────
 
 async def run_worker(core_agent, poll_interval: int = 20) -> None:
     """Login, connect, then listen via SSE + heartbeat fallback."""
