@@ -9,7 +9,7 @@ from docx.oxml import OxmlElement
 
 logger = logging.getLogger(__name__)
 
-# ── OMNISHORE brand palette ───────────────────────────────────────────────────
+# omnishore brand palette
 C = {
     "navy":       "0D2B6B",
     "navy2":      "1F3864",
@@ -66,7 +66,7 @@ STEP_FR = {
 }
 
 
-# ── Low-level helpers ─────────────────────────────────────────────────────────
+# low-level helpers
 
 import re as _re
 
@@ -219,7 +219,7 @@ def _scorecard(doc, total, passed, failed, partial, rate):
     doc.add_paragraph()
 
 
-# ── Header / footer setup ─────────────────────────────────────────────────────
+# header / footer setup
 
 def _setup_header(section, url: str):
     header = section.header
@@ -244,7 +244,7 @@ def _setup_footer(section):
     r.font.color.rgb = _rgb(C["navy"])
 
 
-# ── Data normalisation ────────────────────────────────────────────────────────
+# data normalisation
 
 def _get_all_results(report_data: dict) -> list:
     """Return a normalised list of result dicts regardless of old/new format."""
@@ -320,7 +320,7 @@ def _severity(overall: str, description: str, expected: str) -> tuple:
     return "FAIBLE — Comportement non conforme mineur", C["neutral"]
 
 
-# ── Section builders ──────────────────────────────────────────────────────────
+# section builders
 
 def _cover_page(doc, url, date_fr, browsers_str, total, passed, failed, partial, rate, plan_only):
     cover = doc.add_table(rows=1, cols=1)
@@ -720,7 +720,7 @@ def _test_card(doc, res: dict, index: int, seen_screenshots: set) -> None:
     exec_by_idx = {sr.get("step", i + 1): sr for i, sr in enumerate(exec_results)}
     has_exec    = bool(exec_results)
 
-    # ── 1. Header table (ID + description | status badge) ─────────────────────
+    # 1. header table (id + description | status badge)
     h_tbl = doc.add_table(rows=1, cols=2)
     h_tbl.style = "Table Grid"
     lc = h_tbl.cell(0, 0)
@@ -746,7 +746,7 @@ def _test_card(doc, res: dict, index: int, seen_screenshots: set) -> None:
     badge.bold = True; badge.font.size = Pt(11); badge.font.name = "Calibri"
     badge.font.color.rgb = _rgb(fg)
 
-    # ── 2. Info table (type / expected / severity) — doc level, NOT nested ────
+    # 2. info table (type / expected / severity) — doc level, not nested
     info_rows = [
         ("Type de test",      "Flux d'authentification complet" if is_auth else "Test fonctionnel"),
         ("Résultat attendu",  res.get("expected") or "—"),
@@ -766,7 +766,7 @@ def _test_card(doc, res: dict, index: int, seen_screenshots: set) -> None:
         vr.font.size = Pt(8.5); vr.font.name = "Calibri"
         vr.font.color.rgb = _rgb(sev_color if ri == 2 else C["slate"])
 
-    # ── 3. Steps table — show actual execution results ────────────────────────
+    # 3. steps table — show actual execution results
     steps = res.get("steps", [])
 
     if steps and not is_auth:
@@ -847,7 +847,7 @@ def _test_card(doc, res: dict, index: int, seen_screenshots: set) -> None:
                         er2.font.color.rgb = _rgb(C["danger"])
         doc.add_paragraph()
 
-    # ── 4. Auth sub-steps table — doc level ───────────────────────────────────
+    # 4. auth sub-steps table — doc level
     auth_steps = res.get("auth_steps", [])
     if is_auth and auth_steps:
         _subsection(doc, "Déroulement du flux d'authentification :")
@@ -878,7 +878,7 @@ def _test_card(doc, res: dict, index: int, seen_screenshots: set) -> None:
             row[3].paragraphs[0].add_run((step.get("note") or "")[:150]).font.size = Pt(7.5)
         doc.add_paragraph()
 
-    # ── 5. Per-browser results table — doc level ──────────────────────────────
+    # 5. per-browser results table — doc level
     if browsers_list:
         _subsection(doc, "Résultats par navigateur :")
         bw_tbl = doc.add_table(rows=len(browsers_list) + 1, cols=3)
@@ -905,7 +905,7 @@ def _test_card(doc, res: dict, index: int, seen_screenshots: set) -> None:
             er.font.color.rgb = _rgb(C["danger"] if bst == "FAILED" else C["slate"])
         doc.add_paragraph()
 
-    # ── 6. Result summary line ────────────────────────────────────────────────
+    # 6. result summary line
     result_p = doc.add_paragraph()
     result_p.paragraph_format.space_before = Pt(2)
     result_p.paragraph_format.space_after  = Pt(4)
@@ -940,8 +940,7 @@ def _test_card(doc, res: dict, index: int, seen_screenshots: set) -> None:
     vr_res.italic     = overall != "PASSED"
     vr_res.font.color.rgb = _rgb(res_color)
 
-    # ── 7. Screenshot — prefer primary_screenshot (semantically correct), deduplicated ──
-    # Try primary_screenshot first (failure point for FAILED/PARTIAL, final state for PASSED)
+    # screenshot: prefer primary (failure point or final state), fall back to any available
     primary_bl = next(
         (bl for bl in browsers_list
          if bl.get("primary_screenshot")
@@ -1300,7 +1299,7 @@ def _conclusion(doc, report_data: dict, total, passed, failed, partial, rate, pl
     fr.font.color.rgb = _rgb(C["muted"])
 
 
-# ── Main entry point ──────────────────────────────────────────────────────────
+# main entry point
 
 def generate_word_report(report_data: dict, browser: str = "chromium",
                           output_dir: str | None = None) -> str:

@@ -32,7 +32,7 @@ def get_llm_spec(max_tokens: int = 2000):
     )
 
 
-# ── JSON extraction helpers ───────────────────────────────────────────────────
+# json extraction helpers
 
 def _repair_truncated_array(text: str) -> list | None:
     """Recover completed objects from a truncated JSON array or dict-wrapped array."""
@@ -266,7 +266,7 @@ def _parse_json_array(raw: str, model, messages: list, retries: int = 2) -> list
     raise ValueError(f"LLM returned invalid JSON after {retries + 1} attempts.")
 
 
-# ── Public LLM functions ──────────────────────────────────────────────────────
+# public llm functions
 
 def generate_test_cases(fields: list, url: str, auth_info: dict | None = None,
                         page_text: str = "") -> list:
@@ -321,7 +321,7 @@ def generate_tests_from_spec(
     )
 
     if has_url:
-        # ── With URL: interactive steps (fill/submit/navigate) ────────────────
+        # with url: interactive steps (fill/submit/navigate)
         _step_fmt = (
             'Steps use action objects:\n'
             '  {"action":"navigate","value":"EXACT_HREF_FROM_sections"}  — navigate to a section (use exact href above)\n'
@@ -338,7 +338,7 @@ def generate_tests_from_spec(
             '{"test_cases":[{"id":"TC001","description":"...","steps":[{"action":"fill","field":"...","value":"..."},{"action":"submit"}],"expected":"..."}]}'
         )
     else:
-        # ── Plan only: narrative describe steps — no real form interactions ───
+        # plan only: narrative describe steps — no real form interactions
         _step_fmt = (
             'Since there is no live URL, steps must be NARRATIVE DESCRIPTIONS of system behavior.\n'
             'Use this step format:\n'
@@ -369,7 +369,7 @@ def generate_tests_from_spec(
         "- Les rôles et permissions doivent respecter strictement la spécification\n\n"
     )
 
-    # ── Pass 1: business requirements — success + failure per requirement (8 cases) ─
+    # pass 1: one success + one failure test case per requirement
     sys_p1 = (
         "You are a senior QA Engineer. Generate exactly 8 system-level scenarios "
         "derived directly from the specification.\n\n"
@@ -390,7 +390,7 @@ def generate_tests_from_spec(
     logger.info("Waiting 65s between passes to stay within Groq TPM quota…")
     time.sleep(65)
 
-    # ── Pass 2: validation, boundaries, security (7 cases) ───────────────────
+    # pass 2: validation, boundaries, security (7 cases)
     covered = json.dumps([tc.get("description", "")[:50] for tc in pass1])
     n2 = len(pass1) + 1
     sys_p2 = (
@@ -420,7 +420,7 @@ def generate_tests_from_spec(
     logger.info("Waiting 70s between passes to stay within Groq TPM quota…")
     time.sleep(70)
 
-    # ── Pass 3: end-to-end journeys & integration flows (6 cases) ────────────
+    # pass 3: end-to-end journeys & integration flows (6 cases)
     all_so_far = json.dumps([tc.get("description", "")[:50] for tc in pass1 + pass2])
     n3 = n2 + len(pass2)
     sys_p3 = (
@@ -451,7 +451,7 @@ def generate_tests_from_spec(
     logger.info("Waiting 70s between passes to stay within Groq TPM quota…")
     time.sleep(70)
 
-    # ── Pass 4: edge cases, concurrency, non-functional (5 cases) ────────────
+    # pass 4: edge cases, concurrency, non-functional (5 cases)
     all_covered = json.dumps([tc.get("description", "")[:50] for tc in pass1 + pass2 + pass3])
     n4 = n3 + len(pass3)
     sys_p4 = (
@@ -511,7 +511,7 @@ def convert_spec_scenarios_to_steps(
 
     model = get_llm_spec(max_tokens=2500)
 
-    # ── Build navigation context ──────────────────────────────────────────────
+    # build navigation context
     sections_ctx = ""
     if sections:
         lines = "\n".join(
@@ -527,7 +527,7 @@ def convert_spec_scenarios_to_steps(
 
     url_ctx = f"Base URL: {url}\n" if url else ""
 
-    # ── Spec content serialiser (reused per batch) ───────────────────────────
+    # spec content serialiser (reused per batch)
     def _build_spec_content(batch_scenarios, batch_reqs, batch_stories, batch_secs):
         content = ""
         for i, sc in enumerate(batch_scenarios, 1):
@@ -638,7 +638,7 @@ def convert_spec_scenarios_to_steps(
         '{"test_cases":[{"id":"TC001","description":"...","steps":[...],"expected":"..."}]}'
     )
 
-    # ── Batched conversion — avoids output-token truncation ──────────────────
+    # batched conversion — avoids output-token truncation
     # Each LLM call handles at most BATCH_SIZE scenarios so the JSON output
     # always fits within max_tokens=2500.
     BATCH_SIZE = 10

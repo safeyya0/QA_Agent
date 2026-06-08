@@ -18,7 +18,7 @@ class Executor:
         self.explore_credentials: dict | None = None
         self.explore_login_url:   str  | None = None
 
-    # ── Main entry point ──────────────────────────────────────────────────────
+
 
     async def execute(self, test_case: dict, url: str) -> dict:
         """Execute a test case and return a result dict with per-step breakdown.
@@ -60,7 +60,7 @@ class Executor:
         steps    = list(test_case.get("steps", []))
         expected = (test_case.get("expected") or "").lower()
 
-        # ── Inject verified credentials for valid-login scenarios ─────────────
+            # inject env/discovered credentials for valid-login steps
         is_valid_login = (
             not re.search(r'\b(fail|error|invalid|incorrect|wrong|reject|empty)\b', expected, re.IGNORECASE)
             and bool(re.search(r'\b(success|log\s+in|dashboard|valid|welcome)\b', expected, re.IGNORECASE))
@@ -76,7 +76,7 @@ class Executor:
             logger.debug("Injecting verified credentials: %s",
                          creds.get("username") or creds.get("email"))
 
-        # ── Navigate to test URL, recover session if redirected ───────────────
+            # navigate and re-auth if the session got dropped
         try:
             await self.browser.open_page(url)
             actual_path   = _urlparse(await self.browser.get_page_url()).path.rstrip("/") or "/"
@@ -115,7 +115,7 @@ class Executor:
         )
         any_step_failed = False
 
-        # ── Per-step execution ────────────────────────────────────────────────
+    
         for i, step in enumerate(steps):
             action = step.get("action") or ("fill" if step.get("field") else "skip")
             sr: dict = {
@@ -329,7 +329,7 @@ class Executor:
 
             step_results.append(sr)
 
-        # ── Auto-submit when fill steps exist but no explicit terminal action ─
+            # no explicit submit in the steps — try submitting the form
         if has_fill_step and not has_explicit_submit:
             try:
                 await self.browser.click_submit()
@@ -338,7 +338,7 @@ class Executor:
                 any_step_failed = True
                 logger.warning("Auto-submit failed in %s: %s", tc_id, submit_err)
 
-        # ── Final verification ─────────────────────────────────────────────────
+            # check whether the test actually passed
         verification_passed = False
         try:
             logger.debug("Verifying %s…", tc_id)
@@ -404,7 +404,7 @@ class Executor:
             result["error"] = str(verify_err)
             logger.info("Verification failed for %s: %s", tc_id, verify_err)
 
-        # ── Determine overall status ──────────────────────────────────────────
+            # roll up step results into a single status
         if not verification_passed:
             result["status"] = "failed"
         elif any_step_failed:
@@ -435,7 +435,7 @@ class Executor:
 
         return result
 
-    # ── Session recovery ──────────────────────────────────────────────────────
+────
 
     async def _re_login(self, login_url: str, credentials: dict) -> None:
         """Re-authenticate when session is lost during platform exploration."""
@@ -457,7 +457,7 @@ class Executor:
         except Exception as e:
             logger.warning("Re-login failed: %s", e)
 
-    # ── Page load (crawl) ─────────────────────────────────────────────────────
+────
 
     async def execute_page_load(self, test_case: dict, url: str) -> dict:
         """Navigate to URL and check for errors — no form interaction."""
@@ -488,7 +488,7 @@ class Executor:
                 pass
         return result
 
-    # ── Auth flow ─────────────────────────────────────────────────────────────
+────
 
     async def execute_auth_flow(self, test_case: dict, url: str) -> dict:
         """Run the full authentication flow: register → login → invalid login → logout."""
@@ -588,7 +588,7 @@ class Executor:
         logger.info("Auth flow complete — status: %s", result["status"])
         return result
 
-    # ── Auth step helpers ─────────────────────────────────────────────────────
+────
 
     async def _step_register(self, auth_info: dict, run_context: dict) -> dict:
         step = {"step": "register", "status": "passed", "note": None, "screenshot": None}
@@ -809,7 +809,7 @@ class Executor:
         return step
 
 
-# ── Module-level multi-browser helpers ────────────────────────────────────────
+
 
 async def run_on_browser(
     browser_name: str,

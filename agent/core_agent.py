@@ -1,4 +1,4 @@
-"""CoreAgent: orchestrates 4-phase QA test run (Auth → Discover → Deep-test → Report)."""
+# Main agent — runs the full QA pipeline: auth, discovery, deep tests, report.
 import asyncio
 import json
 import logging
@@ -24,9 +24,8 @@ logger = logging.getLogger(__name__)
 
 
 class CoreAgent:
-    """Top-level QA agent: Auth → Discover → Deep-test → Report."""
+    """Runs the full test pipeline against a target URL."""
 
-    # ── Report helpers ──────────────────────────────────────────────────────────
 
     def _save_and_build_report(
         self,
@@ -121,7 +120,7 @@ class CoreAgent:
         report["report_file"] = os.path.basename(path)
         return report
 
-    # ── Credential helpers ──────────────────────────────────────────────────────
+
 
     @staticmethod
     def _find_credentials_from_steps(test_cases: list[dict]) -> dict | None:
@@ -256,7 +255,7 @@ class CoreAgent:
             await bw.close()
         return None
 
-    # ── PHASE 1 — Auth ──────────────────────────────────────────────────────────
+    # --- phase 1: auth ---
 
     async def _phase_auth(
         self,
@@ -355,7 +354,7 @@ class CoreAgent:
 
         return auth_matrix, credentials
 
-    # ── PHASE 2 — Discovery ─────────────────────────────────────────────────────
+    # --- phase 2: discovery ---
 
     async def _phase_discover(
         self,
@@ -504,7 +503,7 @@ class CoreAgent:
         finally:
             await bw.close()
 
-    # ── PHASE 3 — Deep testing ──────────────────────────────────────────────────
+    # --- phase 3: deep test ---
 
     async def _phase_deep_test(
         self,
@@ -533,7 +532,7 @@ class CoreAgent:
             if emit_fn:
                 emit_fn({"log": f"[PHASE 3] Section {i}/{len(sections)}: {section_name}"})
 
-            # ── Navigate & observe (single browser, fast) ──────────────────
+
             bw       = BrowserWrapper()
             observer = Observer(bw)
             planner  = Planner()
@@ -652,7 +651,7 @@ class CoreAgent:
         print(f"[PHASE 3] Done — {len(matrix)} results collected.")
         return matrix
 
-    # ── Unauthenticated crawl (no credentials) ──────────────────────────────────
+
 
     async def _crawl_and_test(
         self,
@@ -815,7 +814,7 @@ class CoreAgent:
         matrix = await run_all_browsers_multi_page(url_tc_pairs, browsers, emit_fn)
         return matrix
 
-    # ── Public API ──────────────────────────────────────────────────────────────
+
 
     async def run_multi_browser(
         self,
@@ -828,13 +827,13 @@ class CoreAgent:
             browsers = ["chromium"]
 
         try:
-            # ── Phase 1: Auth ──────────────────────────────────────────────────
+            # phase 1: auth
             auth_matrix, credentials = await self._phase_auth(url, browsers, emit_fn)
 
-            # ── Phase 2: Discover authenticated sections ───────────────────────
+            # phase 2: discover nav sections
             sections = await self._phase_discover(url, credentials, browsers[0], emit_fn)
 
-            # ── Phase 3: Deep test each section ───────────────────────────────
+            # phase 3: deep test
             if sections:
                 deep_matrix = await self._phase_deep_test(
                     url, sections, credentials, browsers, emit_fn
@@ -885,7 +884,7 @@ class CoreAgent:
         has_url = bool(url and url.strip())
         planner = Planner()
 
-        # ── Plan-only mode (no URL) ──────────────────────────────────────────
+        # no URL given — just generate a test plan, no execution
         if not has_url:
             print("[SPEC] No URL provided — generating requirements test plan only.")
             if emit_fn:
@@ -907,16 +906,16 @@ class CoreAgent:
             }
             return self._save_and_build_report("", browsers, spec_cases, spec_matrix, plan_only=True)
 
-        # ── Live execution mode (spec + URL) ─────────────────────────────────
+        # full run with spec + URL
         print(f"[SPEC] Requirements-driven test run on {url}")
         if emit_fn:
             emit_fn({"log": f"[SPEC] Tests guidés par exigences sur {url}"})
 
         try:
-            # ── Phase 1: auth — get credentials and run auth test cases ───────
+            # phase 1: auth
             auth_matrix, credentials = await self._phase_auth(url, browsers, emit_fn)
 
-            # ── Observe URL (authenticated if possible) — real field names ────
+            # observe the page to get real field names for the LLM
             print("[SPEC] Observing live page to extract real form fields…")
             if emit_fn:
                 emit_fn({"log": "[SPEC] Observation de la page pour les champs réels…"})
@@ -959,7 +958,7 @@ class CoreAgent:
             finally:
                 await bw.close()
 
-            # ── Phase 2: discover real section URLs so LLM generates correct navigate steps
+            # phase 2: grab real section URLs so nav steps are accurate
             print("[SPEC] Discovering app sections for accurate navigation…")
             if emit_fn:
                 emit_fn({"log": "[SPEC] Découverte des sections pour navigation précise…"})
@@ -967,7 +966,7 @@ class CoreAgent:
             if spec_sections:
                 print(f"[SPEC] {len(spec_sections)} sections discovered — LLM will use real URLs.")
 
-            # ── Generate test cases from spec + real fields + real section URLs ─
+            # generate test cases from spec using real page data
             print(f"[SPEC] Generating test cases from requirements file ({len(spec_text)} chars, {len(real_fields)} real fields, {len(spec_sections)} sections)…")
             if emit_fn:
                 emit_fn({"log": f"[SPEC] Génération depuis les exigences ({len(spec_text)} chars)…"})
@@ -979,7 +978,7 @@ class CoreAgent:
             if emit_fn:
                 emit_fn({"log": f"[SPEC] {len(spec_cases)} tests générés depuis les exigences."})
 
-            # ── Execute spec test cases against the live app ──────────────────
+            # run the test cases
             # Skip auth_flow — already executed in Phase 1
             # Deduplicate by description (case-insensitive) before executing
             seen_desc: set[str] = set()
@@ -1009,7 +1008,7 @@ class CoreAgent:
                     login_url=url,
                 )
 
-            # ── Merge: spec results only (auth_matrix used for creds only) ───────
+            # merge — exclude auth_matrix (spec already covers login scenarios)
             # auth_matrix is intentionally excluded — the spec file already contains
             # login/logout scenarios (TC-001, TC-002, TC-012…). Including auth_matrix
             # would duplicate those tests under AUTH_FLOW_001 / VALID_LOGIN IDs.
@@ -1021,7 +1020,7 @@ class CoreAgent:
 
         return self._save_and_build_report(url, browsers, spec_cases, matrix)
 
-    # ── Backward-compat single-browser wrappers ────────────────────────────────
+
 
     async def run(self, url: str, browser_type: str = "chromium", emit_fn=None) -> dict:
         """Single-browser convenience wrapper."""

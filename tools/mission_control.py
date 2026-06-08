@@ -1,18 +1,6 @@
-"""
-Mission Control bridge for OMNISHORE QA Agent.
-
-Connection flow:
-  1. POST /api/auth/login      → obtain session cookie
-  2. POST /api/connect         → obtain connection_id, agent_id, sse_url, heartbeat_url
-  3. Listen SSE /api/events    → real-time task assignments
-  4. Poll GET heartbeat        → fallback every 20s
-  5. PUT /api/tasks/{id}       → report results
-
-Environment variables:
-  MISSION_CONTROL_URL   — e.g. http://localhost:3000  (required to enable)
-  MISSION_CONTROL_USER  — admin username               (required)
-  MISSION_CONTROL_PASS  — admin password               (required)
-"""
+# Bridge between the QA agent and Mission Control.
+# Logs in, connects, then listens for tasks via SSE + heartbeat polling.
+# Set MISSION_CONTROL_URL in .env to enable — without it nothing runs.
 import asyncio
 import json
 import logging
@@ -26,8 +14,8 @@ MC_URL  = (os.getenv("MISSION_CONTROL_URL") or "").rstrip("/")
 MC_USER = os.getenv("MISSION_CONTROL_USER", "admin")
 MC_PASS = os.getenv("MISSION_CONTROL_PASS", "")
 
-# ── Shared state ───────────────────────────────────────────────────────────────
-_session_cookie: str | None = None   # mc_session=... cookie value
+# kept at module level so login/connect/worker all share the same session
+_session_cookie: str | None = None
 _connection_id:  str | None = None
 _agent_id:       int | None = None
 _heartbeat_url:  str | None = None
@@ -43,8 +31,6 @@ def _auth_headers() -> dict:
     return h
 
 
-# ── 1. Login — get session cookie ─────────────────────────────────────────────
-
 async def login() -> bool:
     """POST /api/auth/login and store the session cookie."""
     global _session_cookie
@@ -56,16 +42,14 @@ async def login() -> bool:
                 headers={"Content-Type": "application/json"},
             )
             resp.raise_for_status()
-            # Extract session cookie from Set-Cookie header
             cookie = resp.headers.get("set-cookie", "")
-            # Keep only the key=value part (before first ;)
             for part in cookie.split(","):
                 part = part.strip()
                 if "mc_session" in part or "session" in part.lower():
                     _session_cookie = part.split(";")[0].strip()
                     break
             if not _session_cookie:
-                # Fallback: use all cookies
+                # just grab whatever cookie is there
                 _session_cookie = "; ".join(
                     p.split(";")[0].strip()
                     for p in cookie.split(",")
@@ -78,10 +62,8 @@ async def login() -> bool:
         return False
 
 
-# ── 2. Bridge connection ───────────────────────────────────────────────────────
-
 async def connect() -> bool:
-    """POST /api/connect with session cookie. Populates module-level state."""
+    """Register this agent with MC and grab the connection/heartbeat URLs."""
     global _connection_id, _agent_id, _heartbeat_url, _sse_url
 
     payload = {
@@ -127,13 +109,10 @@ async def disconnect() -> None:
         logger.debug("[MC Bridge] disconnect() error: %s", exc)
 
 
-# ── 3. Poll heartbeat ─────────────────────────────────────────────────────────
-
 async def poll_assigned_tasks() -> list[dict]:
-    """Poll heartbeat + fallback query for tasks failed by OpenClaw dispatch."""
+    """Check heartbeat for new tasks + pick up any that OpenClaw failed to dispatch."""
     tasks = []
 
-    # Primary: heartbeat work_items
     if _heartbeat_url:
         try:
             async with httpx.AsyncClient(timeout=10) as client:
@@ -146,7 +125,7 @@ async def poll_assigned_tasks() -> list[dict]:
         except Exception as exc:
             logger.debug("[MC Bridge] heartbeat error: %s", exc)
 
-    # Fallback: query tasks assigned to our agent that failed via OpenClaw dispatch
+    # also grab failed tasks in case OpenClaw dropped them
     if _agent_id:
         try:
             async with httpx.AsyncClient(timeout=10) as client:
@@ -170,8 +149,6 @@ async def poll_assigned_tasks() -> list[dict]:
     return tasks
 
 
-# ── 4. Update task ─────────────────────────────────────────────────────────────
-
 async def update_task(task_id: int, status: str, result: dict | None = None) -> bool:
     payload: dict = {"status": status}
     if result is not None:
@@ -193,11 +170,9 @@ async def update_task(task_id: int, status: str, result: dict | None = None) -> 
             resp.raise_for_status()
         return True
     except Exception as exc:
-        logger.warning("[MC Bridge] update_task(%s) error: %s", task_id, exc)
+        print(f"[MC Bridge] update_task({task_id}) error: {exc}")
         return False
 
-
-# ── 5. SSE listener ───────────────────────────────────────────────────────────
 
 async def _listen_sse(on_task) -> None:
     if not _sse_url:
@@ -229,7 +204,39 @@ async def _listen_sse(on_task) -> None:
         logger.warning("[MC Bridge] SSE stream error: %s", exc)
 
 
-# ── 6. Task execution ─────────────────────────────────────────────────────────
+# ping OmniBot directly so it doesn't have to wait for the SSE to fire
+
+_OMNIBOT_URL = (os.getenv("OMNIBOT_URL") or "").rstrip("/")
+
+
+async def _notify_omnibot(
+    task_id: int, task: dict, result: dict, word_path: str
+) -> None:
+    if not _OMNIBOT_URL:
+        return
+    passed  = result.get("passed", 0)
+    failed  = result.get("failed", 0)
+    partial = result.get("partial", 0)
+    total   = result.get("total_tests", 0)
+    payload = {
+        "event": "activity.task_status_changed",
+        "data": {
+            "id":               task_id,
+            "title":            task.get("title", f"Task {task_id}"),
+            "status":           "quality_review",
+            "assigned_to":      "omnishore-qa",
+            "result":           f"PASSED:{passed}  FAILED:{failed}  PARTIAL:{partial}  / {total} tests",
+            "word_report_path": os.path.abspath(word_path) if word_path else "",
+        },
+    }
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            await client.post(f"{_OMNIBOT_URL}/webhook", json=payload)
+        print(f"[MC Bridge] OmniBot notified for task {task_id}.")
+    except Exception as exc:
+        logger.debug("[MC Bridge] OmniBot notify error: %s", exc)
+
+
 
 def _parse_task_params(task: dict) -> tuple[str, str, list[str]]:
     raw = task.get("description") or task.get("title") or task.get("name") or ""
@@ -239,13 +246,16 @@ def _parse_task_params(task: dict) -> tuple[str, str, list[str]]:
         params = {"url": raw.strip()}
     url  = params.get("url", "")
     spec = params.get("spec", "")
-    # If spec looks like a file path, read it
     if spec and not spec.startswith("#") and len(spec) < 260:
         import pathlib
         p = pathlib.Path(spec)
-        if p.suffix in (".md", ".txt") and p.exists():
-            spec = p.read_text(encoding="utf-8")
-            print(f"[MC Bridge] Loaded spec from {p}")
+        if p.suffix in (".md", ".txt"):
+            if p.exists():
+                spec = p.read_text(encoding="utf-8")
+                print(f"[MC Bridge] Loaded spec from {p}")
+            else:
+                print(f"[MC Bridge] Spec file not found: {p}")
+                spec = ""
     browsers = [b.strip() for b in params.get("browsers", "chromium").split(",") if b.strip()]
     return url, spec, browsers
 
@@ -259,6 +269,10 @@ async def _execute_task(task: dict, core_agent) -> None:
     url, spec, browsers = _parse_task_params(task)
     if not url:
         print(f"[MC Bridge] Task {task_id} has no URL — marking failed.")
+        await update_task(task_id, "failed")
+        return
+    if not spec:
+        print(f"[MC Bridge] Task {task_id} has no spec (.md) — marking failed.")
         await update_task(task_id, "failed")
         return
 
@@ -282,15 +296,16 @@ async def _execute_task(task: dict, core_agent) -> None:
             print(f"[MC Bridge] Word report → {download_url}")
         else:
             result["word_report"] = word_path
-        await update_task(task_id, "done", result)
+        ok = await update_task(task_id, "quality_review", result)
+        if not ok:
+            logger.warning("[MC Bridge] update_task(%s) to quality_review failed — task may be stuck.", task_id)
         print(f"[MC Bridge] Task {task_id} completed.")
         await _save_report_to_memory(task_id, url, result)
+        await _notify_omnibot(task_id, task, result, word_path)
     except Exception as exc:
         print(f"[MC Bridge] Task {task_id} failed: {exc}")
         await update_task(task_id, "failed")
 
-
-# ── 7. Save report to Memory/Files ───────────────────────────────────────────
 
 async def _save_report_to_memory(task_id: int, url: str, result: dict) -> None:
     """Save a markdown report summary to Mission Control Memory → Files."""
@@ -332,8 +347,6 @@ async def _save_report_to_memory(task_id: int, url: str, result: dict) -> None:
     except Exception as exc:
         logger.debug("[MC Bridge] memory save error: %s", exc)
 
-
-# ── 8. Main worker ────────────────────────────────────────────────────────────
 
 async def run_worker(core_agent, poll_interval: int = 20) -> None:
     """Login, connect, then listen via SSE + heartbeat fallback."""

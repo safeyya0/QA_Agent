@@ -42,9 +42,6 @@ app = FastAPI(title="OMNISHORE QA Agent", lifespan=lifespan)
 os.makedirs("output", exist_ok=True)
 app.mount("/static", StaticFiles(directory="frontend"), name="static")
 
-
-# ── Live log streaming ────────────────────────────────────────────────────────
-
 _log_subs: list[asyncio.Queue] = []
 _orig_print = builtins.print
 
@@ -100,7 +97,7 @@ class _SSELogHandler(logging.Handler):
 _sse_handler = _SSELogHandler()
 _sse_handler.setFormatter(logging.Formatter("[%(levelname)s] %(name)s: %(message)s"))
 
-# Attach to the root logger so all modules' loggers propagate here
+# hook into the root logger so all module logs go to the SSE stream too
 _root_logger = logging.getLogger()
 _root_logger.addHandler(_sse_handler)
 _root_logger.setLevel(logging.INFO)
@@ -136,14 +133,10 @@ async def stream_logs():
     )
 
 
-# ── UI ────────────────────────────────────────────────────────────────────────
-
 @app.get("/")
 async def serve_ui():
     return FileResponse("frontend/index.html")
 
-
-# ── Runs history ──────────────────────────────────────────────────────────────
 
 @app.get("/api/runs")
 async def list_runs():
@@ -180,7 +173,11 @@ async def get_run(filename: str):
         return json.load(f)
 
 
-# ── Agent run endpoints ───────────────────────────────────────────────────────
+@app.post("/api/retry-task/{task_id}")
+async def retry_task(task_id: int):
+    from tools.mission_control import _processed
+    _processed.discard(task_id)
+    return {"ok": True, "task_id": task_id, "message": "Task removed from processed set — will re-execute on next poll."}
 
 def _normalize_url(url: str) -> str:
     url = url.strip()
@@ -222,8 +219,6 @@ async def run_agent_with_spec(
         _broadcast_done()
 
 
-# ── Word export ───────────────────────────────────────────────────────────────
-
 @app.get("/api/runs/{filename}/export/word")
 async def export_word(filename: str):
     if not filename.startswith("report_") or not filename.endswith(".json"):
@@ -243,15 +238,12 @@ async def export_word(filename: str):
     )
 
 
-# ── Generate report only (direct .docx download) ─────────────────────────────
-
 @app.post("/api/generate-report-only")
 async def generate_report_only(
     url: str = Form(default=""),
     browsers: str = Form(default="chromium"),
     spec_file: UploadFile = File(default=None),
 ):
-    """Run full pipeline and return the Word report directly as a download."""
     has_file = spec_file is not None and spec_file.filename
     has_url  = bool(url and url.strip())
     if not has_file and not has_url:
@@ -277,8 +269,6 @@ async def generate_report_only(
     finally:
         _broadcast_done()
 
-
-# ── Trello ────────────────────────────────────────────────────────────────────
 
 @app.get("/api/trello/status")
 async def trello_status():

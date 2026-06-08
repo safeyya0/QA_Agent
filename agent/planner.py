@@ -18,7 +18,7 @@ PAGE_CTX_GENERAL   = "general"    # everything else
 class Planner:
     """Turns observed page elements into a structured test plan."""
 
-    # ── Page context detection ─────────────────────────────────────────────────
+
 
     def detect_page_context(self, elements: list[dict[str, Any]]) -> str:
         """Classify the page type from its element list.
@@ -52,7 +52,7 @@ class Planner:
             return PAGE_CTX_DATA_FORM
         return PAGE_CTX_GENERAL
 
-    # ── Live-page planning ─────────────────────────────────────────────────────
+
 
     def plan(
         self,
@@ -79,7 +79,7 @@ class Planner:
             url, page_context, auth_info["has_login"], auth_info["has_register"],
         )
 
-        # ── Build rich page_context dict for the LLM ─────────────────────────
+        # build context dict so the LLM knows what fields/buttons actually exist
         pi = page_info or {}
 
         # Unique, non-empty button/link texts
@@ -163,7 +163,7 @@ class Planner:
 
         return test_cases
 
-    # ── Spec-based planning (no live URL) ──────────────────────────────────────
+
 
     def plan_from_spec(
         self,
@@ -196,7 +196,7 @@ class Planner:
         )
 
         if has_structured:
-            # ── PRIMARY: convert spec's own scenarios to executable steps ─────
+            # primary: convert spec's own scenarios to executable steps
             logger.info(
                 "Spec has structured content (%d scenarios, %d requirements, %d stories) "
                 "— converting to executable test cases.",
@@ -207,7 +207,7 @@ class Planner:
             test_cases = convert_spec_scenarios_to_steps(parsed, fields, url, sections=sections)
             logger.info("Converted %d spec scenarios to executable test cases.", len(test_cases))
         else:
-            # ── FALLBACK: spec is plain text — generate scenarios from content ─
+            # spec has no structured scenarios — fall back to LLM generation
             logger.info(
                 "Spec has no structured scenarios — falling back to 4-pass generation (%d chars).",
                 len(spec_text),
@@ -224,7 +224,7 @@ class Planner:
         logger.info("Total spec test cases: %d.", len(test_cases))
         return test_cases
 
-    # ── Markdown spec parser ───────────────────────────────────────────────────
+
 
     def parse_markdown_spec(self, spec_text: str) -> dict[str, Any]:
         """Parse a markdown spec into sections, requirements, and BDD scenarios.
@@ -266,7 +266,7 @@ class Planner:
             if not s:
                 continue
 
-            # ── Heading line ─────────────────────────────────────────────────
+            # heading
             if s.startswith("#"):
                 tc_m = _tc_pat.match(s)
                 if tc_m:
@@ -294,7 +294,7 @@ class Planner:
                     result["sections"].append({"title": heading, "content": []})
                     current_section = heading
 
-            # ── Content inside a TC scenario ─────────────────────────────────
+            # inside a TC block
             elif current_scenario is not None:
 
                 # Markdown table row: | N° | Action | Résultat attendu |
@@ -357,7 +357,7 @@ class Planner:
                     elif em and not current_scenario["expected"]:
                         current_scenario["expected"] = em.group(1).strip()
 
-            # ── Content outside any TC ────────────────────────────────────────
+            # outside any TC block
             else:
                 req_m = _req_pat.match(s)
                 if req_m:
@@ -419,7 +419,7 @@ class Planner:
 
         return test_cases
 
-    # ── Helpers ────────────────────────────────────────────────────────────────
+
 
     def _auth_scenario(self, auth_info: dict[str, Any]) -> dict[str, Any]:
         """Return the canonical auth-flow meta test-case."""

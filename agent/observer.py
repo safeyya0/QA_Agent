@@ -1,4 +1,4 @@
-"""Observer: extracts ALL interactive elements from a page, not just form inputs."""
+# Scrapes every interactive element from a page — forms, buttons, nav, tables.
 import logging
 from typing import Any
 from tools.browser import BrowserWrapper
@@ -7,19 +7,14 @@ logger = logging.getLogger(__name__)
 
 
 class Observer:
-    """Navigates to a URL and extracts every interactive element with its category."""
+    """Opens a page and pulls out everything interactive."""
 
     def __init__(self, browser: BrowserWrapper) -> None:
         self.browser = browser
 
     async def observe(self, url: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        """Return (elements, page_info) for the given URL.
-
-        elements is a flat list of dicts, each with a 'category' key:
-          'form_field'   — input / select / textarea
-          'action'       — button / [role=button] / submit / a.btn / icon buttons
-          'data_display' — table (headers + row count)
-          'navigation'   — nav / sidebar / menu links
+        """Navigate to url and return (elements, page_info).
+        Each element has a category: form_field, action, data_display, or navigation.
         """
         logger.info("Observing %s", url)
         await self.browser.open_page(url)
@@ -63,7 +58,6 @@ class Observer:
         logger.info("observe_current: %d elements at %s", len(elements), page_info.get("current_url", "?"))
         return elements, page_info
 
-    # ── Form fields ────────────────────────────────────────────────────────────
 
     async def _extract_form_fields(self) -> list[dict[str, Any]]:
         """Extract visible input / select / textarea elements."""
@@ -122,7 +116,6 @@ class Observer:
 
         return results
 
-    # ── Action buttons ─────────────────────────────────────────────────────────
 
     async def _extract_buttons(self) -> list[dict[str, Any]]:
         """Extract all clickable action elements."""
@@ -166,7 +159,6 @@ class Observer:
 
         return results
 
-    # ── Icon-only interactive elements ────────────────────────────────────────
 
     async def _extract_icon_elements(self) -> list[dict[str, Any]]:
         """Detect icon-only buttons/links that have no visible text.
@@ -390,14 +382,13 @@ class Observer:
                         len(results), [r["text"] for r in results])
         return results
 
-    # ── Data tables ────────────────────────────────────────────────────────────
 
     async def _extract_tables(self) -> list[dict[str, Any]]:
         """Extract tables — both native <table> and ARIA/Vue.js div-based grids."""
         page = self.browser.page
         results: list[dict[str, Any]] = []
 
-        # ── Native <table> elements ────────────────────────────────────────────
+        # native tables
         try:
             for table in await page.query_selector_all("table"):
                 try:
@@ -419,8 +410,7 @@ class Observer:
         except Exception:
             pass
 
-        # ── ARIA / Vue.js / custom grid tables (role="grid", role="table") ────
-        # OrangeHRM, AG-Grid, Vue-Table, etc. use div-based grids with ARIA roles
+        # div-based grids (OrangeHRM, AG-Grid, etc. use role="grid" instead of <table>)
         if not results:
             try:
                 grid_data = await page.evaluate("""
@@ -462,7 +452,6 @@ class Observer:
 
         return results
 
-    # ── Nav links ──────────────────────────────────────────────────────────────
 
     async def _extract_nav_links(self) -> list[dict[str, Any]]:
         """Extract navigation / sidebar / menu links, skipping logout links."""
@@ -506,7 +495,6 @@ class Observer:
 
         return results[:30]
 
-    # ── Page metadata ──────────────────────────────────────────────────────────
 
     async def _extract_page_info(self) -> dict[str, Any]:
         """Return title, current URL, and first 500 chars of body text."""
