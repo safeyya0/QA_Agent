@@ -1,0 +1,188 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="1130" viewBox="0 0 1400 1130" font-family="DejaVu Sans, Arial, sans-serif">
+
+<defs>
+  <filter id="sh" x="-20%" y="-20%" width="140%" height="140%">
+    <feDropShadow dx="0" dy="3" stdDeviation="4" flood-color="#1E293B" flood-opacity="0.10"/>
+  </filter>
+  <marker id="arrow" markerWidth="11" markerHeight="11" refX="8" refY="5" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 L3,5 Z" fill="#475569"/></marker>
+  <marker id="arrowP" markerWidth="11" markerHeight="11" refX="8" refY="5" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 L3,5 Z" fill="#8B5CF6"/></marker>
+  <marker id="arrowC" markerWidth="11" markerHeight="11" refX="8" refY="5" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 L3,5 Z" fill="#06B6D4"/></marker>
+
+  <symbol id="ic-user" viewBox="0 0 40 40">
+    <circle cx="20" cy="13" r="7" fill="white"/>
+    <path d="M6,35 C6,23 34,23 34,35 Z" fill="white"/></symbol>
+  <symbol id="ic-dash" viewBox="0 0 40 40">
+    <rect x="6" y="6" width="12" height="11" rx="2" fill="white"/>
+    <rect x="22" y="6" width="12" height="11" rx="2" fill="white"/>
+    <rect x="6" y="21" width="12" height="13" rx="2" fill="white"/>
+    <rect x="22" y="21" width="12" height="13" rx="2" fill="white"/></symbol>
+  <symbol id="ic-hub" viewBox="0 0 40 40">
+    <line x1="20" y1="20" x2="8" y2="8" stroke="white" stroke-width="2"/>
+    <line x1="20" y1="20" x2="32" y2="8" stroke="white" stroke-width="2"/>
+    <line x1="20" y1="20" x2="8" y2="32" stroke="white" stroke-width="2"/>
+    <line x1="20" y1="20" x2="32" y2="32" stroke="white" stroke-width="2"/>
+    <circle cx="8" cy="8" r="3.5" fill="white"/><circle cx="32" cy="8" r="3.5" fill="white"/>
+    <circle cx="8" cy="32" r="3.5" fill="white"/><circle cx="32" cy="32" r="3.5" fill="white"/>
+    <circle cx="20" cy="20" r="5.5" fill="white"/></symbol>
+  <symbol id="ic-robot" viewBox="0 0 40 40">
+    <line x1="20" y1="3" x2="20" y2="9" stroke="white" stroke-width="2"/>
+    <circle cx="20" cy="3" r="2" fill="white"/>
+    <rect x="7" y="9" width="26" height="23" rx="6" fill="white"/>
+    <circle cx="15" cy="19" r="2.6" fill="#1E293B"/>
+    <circle cx="25" cy="19" r="2.6" fill="#1E293B"/>
+    <rect x="14" y="25" width="12" height="2.4" rx="1.2" fill="#1E293B"/></symbol>
+  <symbol id="ic-ai" viewBox="0 0 40 40">
+    <path d="M20,5 L23,15 L33,18 L23,21 L20,31 L17,21 L7,18 L17,15 Z" fill="white"/>
+    <path d="M31,26 L32.4,29.6 L36,31 L32.4,32.4 L31,36 L29.6,32.4 L26,31 L29.6,29.6 Z" fill="white"/></symbol>
+  <symbol id="ic-tool" viewBox="0 0 40 40">
+    <circle cx="20" cy="20" r="7" fill="none" stroke="white" stroke-width="3"/>
+    <circle cx="20" cy="20" r="2.5" fill="white"/>
+    <rect x="18" y="3" width="4" height="6" rx="1" fill="white"/>
+    <rect x="18" y="31" width="4" height="6" rx="1" fill="white"/>
+    <rect x="3" y="18" width="6" height="4" rx="1" fill="white"/>
+    <rect x="31" y="18" width="6" height="4" rx="1" fill="white"/></symbol>
+  <symbol id="ic-play" viewBox="0 0 40 40">
+    <rect x="5" y="8" width="30" height="24" rx="3" fill="white"/>
+    <rect x="5" y="8" width="30" height="6" rx="3" fill="#1E293B"/>
+    <path d="M17,17 L27,22 L17,27 Z" fill="#1E293B"/></symbol>
+  <symbol id="ic-globe" viewBox="0 0 40 40">
+    <circle cx="20" cy="20" r="13" fill="none" stroke="white" stroke-width="2.6"/>
+    <ellipse cx="20" cy="20" rx="5.5" ry="13" fill="none" stroke="white" stroke-width="2"/>
+    <line x1="7" y1="20" x2="33" y2="20" stroke="white" stroke-width="2"/></symbol>
+  <symbol id="ic-doc" viewBox="0 0 40 40">
+    <rect x="10" y="5" width="20" height="30" rx="2" fill="white"/>
+    <line x1="14" y1="13" x2="26" y2="13" stroke="#64748B" stroke-width="2"/>
+    <line x1="14" y1="19" x2="26" y2="19" stroke="#64748B" stroke-width="2"/>
+    <line x1="14" y1="25" x2="26" y2="25" stroke="#64748B" stroke-width="2"/>
+    <line x1="14" y1="31" x2="22" y2="31" stroke="#64748B" stroke-width="2"/></symbol>
+</defs>
+
+<rect x="0" y="0" width="1400" height="1130" fill="#F4F8FB"/>
+<text x="70" y="58" font-size="32" font-weight="700" fill="#15795A">Architecture Globale — Plateforme QA Multi-Agents</text>
+<text x="72" y="88" font-size="15" fill="#64748B">Génération &amp; exécution automatisées de tests, pilotées par IA générative · OMNISHORE</text>
+<rect x="72" y="100" width="120" height="4" rx="2" fill="#1E9E6A"/>
+<rect x="1175" y="40" width="155" height="46" rx="12" fill="#ECFDF5" stroke="#1E9E6A" stroke-width="1.5"/>
+<text x="1252" y="62" font-size="15" font-weight="700" fill="#15795A" text-anchor="middle">OMNISHORE</text>
+<text x="1252" y="78" font-size="10" fill="#5E8C78" text-anchor="middle" letter-spacing="1">QA PLATFORM</text>
+<rect x="130" y="150" width="240" height="92" rx="14" fill="#EEF2FF" stroke="#6366F1" stroke-width="2" filter="url(#sh)"/>
+<rect x="146" y="173.0" width="46" height="46" rx="12" fill="#6366F1"/>
+<use href="#ic-user" x="154" y="181.0" width="30" height="30"/>
+<text x="208" y="180" font-size="16" font-weight="700" fill="#16243A">Utilisateur QA</text>
+<text x="208" y="197" font-size="12" fill="#46566B">Ingénieur de test</text>
+<text x="208" y="214" font-size="12" fill="#46566B">Pilotage &amp; supervision</text>
+<rect x="470" y="146" width="340" height="104" rx="14" fill="#ECFDF5" stroke="#1E9E6A" stroke-width="2" filter="url(#sh)"/>
+<rect x="486" y="175.0" width="46" height="46" rx="12" fill="#1E9E6A"/>
+<use href="#ic-dash" x="494" y="183.0" width="30" height="30"/>
+<text x="548" y="176" font-size="16" font-weight="700" fill="#16243A">Control Panel (OMNISHORE)</text>
+<text x="548" y="193" font-size="12" fill="#46566B">Next.js · React · SQLite — Kanban</text>
+<text x="548" y="210" font-size="12" fill="#46566B">Supervision temps réel (SSE/WS) · RBAC</text>
+<line x1="370" y1="196" x2="466" y2="198" stroke="#475569" stroke-width="2.4" marker-end="url(#arrow)"/>
+<rect x="110" y="360" width="300" height="450" rx="18" fill="#FFFFFF" stroke="#D7E2EC" stroke-width="1.5" stroke-dasharray="2 6"/><text x="132" y="386" font-size="12" font-weight="700" letter-spacing="2" fill="#9AAABC">ENTRÉES</text>
+<rect x="440" y="360" width="380" height="450" rx="18" fill="#FFFFFF" stroke="#D7E2EC" stroke-width="1.5" stroke-dasharray="2 6"/><text x="462" y="386" font-size="12" font-weight="700" letter-spacing="2" fill="#9AAABC">PIPELINE MULTI-AGENTS (ORCHESTRÉ)</text>
+<rect x="950" y="360" width="360" height="450" rx="18" fill="#FFFFFF" stroke="#D7E2EC" stroke-width="1.5" stroke-dasharray="2 6"/><text x="972" y="386" font-size="12" font-weight="700" letter-spacing="2" fill="#9AAABC">RESSOURCES IA PARTAGÉES</text>
+<rect x="110" y="830" width="1200" height="280" rx="18" fill="#FFFFFF" stroke="#D7E2EC" stroke-width="1.5" stroke-dasharray="2 6"/><text x="132" y="856" font-size="12" font-weight="700" letter-spacing="2" fill="#9AAABC">EXÉCUTION &amp; REPORTING</text>
+<rect x="475" y="386" width="310" height="64" rx="14" fill="#FFFBEB" stroke="#F59E0B" stroke-width="2" filter="url(#sh)"/>
+<rect x="491" y="395.0" width="46" height="46" rx="12" fill="#F59E0B"/>
+<use href="#ic-hub" x="499" y="403.0" width="30" height="30"/>
+<text x="553" y="416" font-size="16" font-weight="700" fill="#16243A">Orchestrateur</text>
+<text x="553" y="433" font-size="12" fill="#46566B">Coordination · Dispatch (FastAPI)</text>
+<line x1="635" y1="250" x2="630" y2="386" stroke="#475569" stroke-width="2.4" marker-end="url(#arrow)"/>
+<rect x="460" y="470" width="340" height="96" rx="14" fill="#EFF6FF" stroke="#3B82F6" stroke-width="2" filter="url(#sh)"/>
+<rect x="476" y="495.0" width="46" height="46" rx="12" fill="#3B82F6"/>
+<use href="#ic-robot" x="484" y="503.0" width="30" height="30"/>
+<text x="538" y="500" font-size="16" font-weight="700" fill="#16243A">Agent d'Analyse</text>
+<text x="538" y="517" font-size="12" fill="#46566B">Entrée : Document SFD</text>
+<text x="538" y="534" font-size="12" fill="#46566B">Sortie : User Stories</text>
+<rect x="460" y="588" width="340" height="96" rx="14" fill="#EEF2FF" stroke="#6366F1" stroke-width="2" filter="url(#sh)"/>
+<rect x="476" y="613.0" width="46" height="46" rx="12" fill="#6366F1"/>
+<use href="#ic-robot" x="484" y="621.0" width="30" height="30"/>
+<text x="538" y="618" font-size="16" font-weight="700" fill="#16243A">Agent de Spécification</text>
+<text x="538" y="635" font-size="12" fill="#46566B">Entrée : Exigences fonctionnelles</text>
+<text x="538" y="652" font-size="12" fill="#46566B">Sortie : .md + fichiers Excel</text>
+<rect x="460" y="706" width="340" height="96" rx="14" fill="#F5F3FF" stroke="#8B5CF6" stroke-width="2" filter="url(#sh)"/>
+<rect x="476" y="731.0" width="46" height="46" rx="12" fill="#8B5CF6"/>
+<use href="#ic-robot" x="484" y="739.0" width="30" height="30"/>
+<text x="538" y="736" font-size="16" font-weight="700" fill="#16243A">Agent de Test E2E</text>
+<text x="538" y="753" font-size="12" fill="#46566B">Entrée : Fichier .md</text>
+<text x="538" y="770" font-size="12" fill="#46566B">Génère code Robot Framework + exécute</text>
+<line x1="630" y1="450" x2="630" y2="470" stroke="#475569" stroke-width="2.4" marker-end="url(#arrow)"/>
+<line x1="630" y1="566" x2="630" y2="588" stroke="#475569" stroke-width="2.4" marker-end="url(#arrow)"/>
+<line x1="630" y1="684" x2="630" y2="706" stroke="#475569" stroke-width="2.4" marker-end="url(#arrow)"/>
+<rect x="130" y="490" width="250" height="56" rx="14" fill="#F8FAFC" stroke="#64748B" stroke-width="2" filter="url(#sh)"/>
+<rect x="146" y="495.0" width="46" height="46" rx="12" fill="#64748B"/>
+<use href="#ic-doc" x="154" y="503.0" width="30" height="30"/>
+<text x="208" y="520" font-size="14" font-weight="700" fill="#16243A">Document SFD</text>
+<text x="208" y="535" font-size="12" fill="#46566B">Spécifications</text>
+<rect x="130" y="608" width="250" height="56" rx="14" fill="#F8FAFC" stroke="#64748B" stroke-width="2" filter="url(#sh)"/>
+<rect x="146" y="613.0" width="46" height="46" rx="12" fill="#64748B"/>
+<use href="#ic-doc" x="154" y="621.0" width="30" height="30"/>
+<text x="208" y="638" font-size="14" font-weight="700" fill="#16243A">Exigences fonct.</text>
+<text x="208" y="653" font-size="12" fill="#46566B">Cahier des charges</text>
+<rect x="130" y="726" width="250" height="56" rx="14" fill="#F8FAFC" stroke="#64748B" stroke-width="2" filter="url(#sh)"/>
+<rect x="146" y="731.0" width="46" height="46" rx="12" fill="#64748B"/>
+<use href="#ic-doc" x="154" y="739.0" width="30" height="30"/>
+<text x="208" y="756" font-size="14" font-weight="700" fill="#16243A">Fichier .md</text>
+<text x="208" y="771" font-size="12" fill="#46566B">issu de l'Agent 2</text>
+<line x1="380" y1="518" x2="458" y2="510" stroke="#475569" stroke-width="2.4" marker-end="url(#arrow)"/>
+<line x1="380" y1="636" x2="458" y2="628" stroke="#475569" stroke-width="2.4" marker-end="url(#arrow)"/>
+<line x1="380" y1="754" x2="458" y2="746" stroke="#475569" stroke-width="2.4" marker-end="url(#arrow)"/>
+<rect x="970" y="462" width="330" height="124" rx="14" fill="#F5F3FF" stroke="#8B5CF6" stroke-width="2" filter="url(#sh)"/>
+<rect x="986" y="501.0" width="46" height="46" rx="12" fill="#8B5CF6"/>
+<use href="#ic-ai" x="994" y="509.0" width="30" height="30"/>
+<text x="1048" y="492" font-size="16" font-weight="700" fill="#16243A">Moteur IA (LLM)</text>
+<text x="1048" y="509" font-size="12" fill="#46566B">Groq · LPU (faible latence)</text>
+<text x="1048" y="526" font-size="12" fill="#46566B">Llama 3.3 70B · Llama 3.1 8B</text>
+<text x="1048" y="543" font-size="12" fill="#46566B">via LangChain (langchain-groq)</text>
+<rect x="970" y="606" width="330" height="178" rx="14" fill="#ECFEFF" stroke="#06B6D4" stroke-width="2" filter="url(#sh)"/>
+<rect x="986" y="672.0" width="46" height="46" rx="12" fill="#06B6D4"/>
+<use href="#ic-tool" x="994" y="680.0" width="30" height="30"/>
+<text x="1048" y="636" font-size="16" font-weight="700" fill="#16243A">Outils &amp; Capacités</text>
+<text x="1048" y="655" font-size="12" fill="#46566B">Tool calling :</text>
+<text x="1048" y="674" font-size="12" fill="#46566B">• Navigation URL · clic · saisie</text>
+<text x="1048" y="693" font-size="12" fill="#46566B">• Attente sélecteur · capture</text>
+<text x="1048" y="712" font-size="12" fill="#46566B">• Extraction DOM (vision DOM)</text>
+<text x="1048" y="731" font-size="12" fill="#46566B">• Robot Framework · Playwright</text>
+<line x1="800" y1="510" x2="968" y2="502" stroke="#8B5CF6" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#arrowP)"/>
+<line x1="800" y1="628" x2="968" y2="524" stroke="#8B5CF6" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#arrowP)"/>
+<line x1="800" y1="746" x2="968" y2="546" stroke="#8B5CF6" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#arrowP)"/>
+<line x1="800" y1="760" x2="968" y2="670" stroke="#06B6D4" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#arrowC)"/>
+<path d="M630,802 C630,840 360,830 300,862" fill="none" stroke="#475569" stroke-width="2.6" marker-end="url(#arrow)"/>
+<text x="430" y="845" font-size="11" fill="#64748B">génère .robot + exécute</text>
+<rect x="150" y="866" width="300" height="92" rx="14" fill="#F0F9FF" stroke="#0EA5E9" stroke-width="2" filter="url(#sh)"/>
+<rect x="166" y="889.0" width="46" height="46" rx="12" fill="#0EA5E9"/>
+<use href="#ic-play" x="174" y="897.0" width="30" height="30"/>
+<text x="228" y="896" font-size="16" font-weight="700" fill="#16243A">Robot Framework</text>
+<text x="228" y="913" font-size="12" fill="#46566B">Browser Library</text>
+<text x="228" y="930" font-size="12" fill="#46566B">scénarios .robot</text>
+<rect x="510" y="866" width="300" height="92" rx="14" fill="#F0FDFA" stroke="#14B8A6" stroke-width="2" filter="url(#sh)"/>
+<rect x="526" y="889.0" width="46" height="46" rx="12" fill="#14B8A6"/>
+<use href="#ic-play" x="534" y="897.0" width="30" height="30"/>
+<text x="588" y="896" font-size="16" font-weight="700" fill="#16243A">Playwright</text>
+<text x="588" y="913" font-size="12" fill="#46566B">Chromium · Firefox</text>
+<text x="588" y="930" font-size="12" fill="#46566B">WebKit · auto-waiting</text>
+<rect x="870" y="866" width="300" height="92" rx="14" fill="#FFFBEB" stroke="#F59E0B" stroke-width="2" filter="url(#sh)"/>
+<rect x="886" y="889.0" width="46" height="46" rx="12" fill="#F59E0B"/>
+<use href="#ic-globe" x="894" y="897.0" width="30" height="30"/>
+<text x="948" y="896" font-size="16" font-weight="700" fill="#16243A">Application Web cible</text>
+<text x="948" y="913" font-size="12" fill="#46566B">Multi-navigateurs</text>
+<text x="948" y="930" font-size="12" fill="#46566B">tests End-to-End</text>
+<line x1="450" y1="912" x2="508" y2="912" stroke="#475569" stroke-width="2.4" marker-end="url(#arrow)"/>
+<line x1="810" y1="912" x2="868" y2="912" stroke="#475569" stroke-width="2.4" marker-end="url(#arrow)"/>
+<rect x="510" y="990" width="560" height="80" rx="14" fill="#ECFDF5" stroke="#10B981" stroke-width="2" filter="url(#sh)"/>
+<rect x="526" y="1007.0" width="46" height="46" rx="12" fill="#10B981"/>
+<use href="#ic-doc" x="534" y="1015.0" width="30" height="30"/>
+<text x="588" y="1020" font-size="16" font-weight="700" fill="#16243A">Sorties &amp; Rapports</text>
+<text x="588" y="1037" font-size="12" fill="#46566B">Rapports Word (.docx) / JSON · Cartes Trello (anomalies)</text>
+<path d="M1020,958 C1020,985 880,975 850,990" fill="none" stroke="#475569" stroke-width="2.4" marker-end="url(#arrow)"/>
+<rect x="1185" y="866" width="118" height="120" rx="10" fill="#FFFFFF" stroke="#D7E2EC" stroke-width="1.2"/>
+<text x="1196" y="888" font-size="11" font-weight="700" fill="#64748B">LÉGENDE</text>
+<line x1="1196" y1="908" x2="1224" y2="908" stroke="#475569" stroke-width="2.4" marker-end="url(#arrow)"/>
+<text x="1230" y="912" font-size="9.5" fill="#46566B">Contrôle</text>
+<line x1="1196" y1="936" x2="1224" y2="936" stroke="#8B5CF6" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#arrowP)"/>
+<text x="1230" y="940" font-size="9.5" fill="#46566B">Appel LLM</text>
+<line x1="1196" y1="964" x2="1224" y2="964" stroke="#06B6D4" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#arrowC)"/>
+<text x="1230" y="968" font-size="9.5" fill="#46566B">Outils</text>
+</svg>
