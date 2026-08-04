@@ -3,6 +3,27 @@ from uuid import uuid4
 from urllib.parse import urljoin
 
 
+# Keyword patterns shared by planner and executor to classify a test case's
+# expected outcome. A "valid login" expectation names a success state and no
+# failure state — those tests get real verified credentials injected.
+_LOGIN_FAILURE_RE = re.compile(
+    r'\b(fail\w*|error\w*|invalid\w*|incorrect|wrong|reject\w*|empty)\b', re.IGNORECASE
+)
+_LOGIN_SUCCESS_RE = re.compile(
+    r'\b(success\w*|log\s+in|logged|dashboard|valid|welcome|redirect\w*|authenticat\w*)\b',
+    re.IGNORECASE,
+)
+
+
+def is_valid_login_expectation(expected: str) -> bool:
+    """True when the expected text describes a SUCCESSFUL login outcome."""
+    expected = expected or ""
+    return (
+        not _LOGIN_FAILURE_RE.search(expected)
+        and bool(_LOGIN_SUCCESS_RE.search(expected))
+    )
+
+
 def generate_test_credentials() -> dict:
     uid = uuid4().hex
     return {

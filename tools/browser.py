@@ -251,11 +251,15 @@ class BrowserWrapper:
         logger.debug("Field '%s' not found on page — skipped.", field_identifier)
 
     async def select_option(self, field_identifier: str, value: str):
-        """Select a dropdown option by field name and option label/value."""
+        """Select a dropdown option by field name, id, class, or data-test attribute."""
         selectors = [
             f"select[name='{field_identifier}']",
             f"select[id='{field_identifier}']",
             f"#{field_identifier}",
+            f"select.{field_identifier}",
+            f"select[class*='{field_identifier}']",
+            f"select[data-test='{field_identifier}']",
+            f"select[data-test*='{field_identifier}']",
         ]
         for sel in selectors:
             try:
@@ -271,9 +275,11 @@ class BrowserWrapper:
 
     # Icon label → CSS class keyword patterns for class-based fallback
     _ICON_CLASS_HINTS: dict[str, list[str]] = {
-        "cart":          ["cart", "bag", "basket", "shopping-cart"],
+        "cart":          ["cart", "bag", "basket", "shopping-cart", "shopping_cart"],
         "toggle menu":   ["hamburger", "burger", "menu-toggle", "nav-toggle",
                           "sidebar-toggle", "menu-btn", "navbar-toggler"],
+        "open menu":     ["burger", "hamburger", "bm-burger", "react-burger-menu-btn"],
+        "close menu":    ["bm-cross", "react-burger-cross-btn", "close-btn", "dismiss-btn"],
         "search":        ["search-icon", "search-btn", "searchbtn"],
         "user profile":  ["user-icon", "profile-icon", "avatar", "account-icon"],
         "notifications": ["notification", "notif-btn", "bell-icon"],

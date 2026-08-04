@@ -6,7 +6,10 @@ import json
 import time
 import logging
 from langchain_groq import ChatGroq
-from langchain.messages import SystemMessage, HumanMessage, AIMessage
+try:
+    from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+except ImportError:  # older installs expose them via the langchain meta-package
+    from langchain.messages import SystemMessage, HumanMessage, AIMessage
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -528,6 +531,19 @@ def convert_spec_scenarios_to_steps(
     url_ctx = f"Base URL: {url}\n" if url else ""
 
     # spec content serialiser (reused per batch)
+    def _parse_testdata_credentials(raw: str) -> tuple[str, str]:
+        """Extract (username, password) from test_data strings like 'user / pass'."""
+        if not raw:
+            return "", ""
+        parts = [p.strip() for p in raw.split("/")]
+        if len(parts) == 2 and parts[0] and parts[1]:
+            return parts[0], parts[1]
+        # key: value format
+        import re as _re
+        um = _re.search(r'(?:user(?:name)?|login|email)[:\s]+(\S+)', raw, _re.IGNORECASE)
+        pm = _re.search(r'(?:pass(?:word)?|mot de passe)[:\s]+(\S+)', raw, _re.IGNORECASE)
+        return (um.group(1) if um else ""), (pm.group(1) if pm else "")
+
     def _build_spec_content(batch_scenarios, batch_reqs, batch_stories, batch_secs):
         content = ""
         for i, sc in enumerate(batch_scenarios, 1):
@@ -543,7 +559,11 @@ def convert_spec_scenarios_to_steps(
             if sc.get("expected"):
                 content += f"Expected: {sc['expected']}\n"
             if sc.get("test_data"):
-                content += f"Test data: {sc['test_data']}\n"
+                td = sc["test_data"]
+                content += f"Test data: {td}\n"
+                u, p = _parse_testdata_credentials(td)
+                if u and p:
+                    content += f"  → Username: {u}  Password: {p}\n"
         for req in batch_reqs:
             content += f"\n=== Requirement {req['id']}: {req['text']}\n"
         for story in batch_stories:
@@ -572,13 +592,32 @@ def convert_spec_scenarios_to_steps(
         "  delete / supprimer       → button labeled 'Delete' or 'Supprimer'\n"
         "  search / rechercher      → button/field labeled 'Search' or 'Rechercher'\n"
         "  edit / modifier          → button labeled 'Edit' or 'Modifier'\n"
-        "  username / identifiant   → fill field='username'\n"
+        "  username / identifiant   → fill field='user-name' (SauceDemo) or field='username'\n"
         "  password / mot de passe  → fill field='password'\n"
         "  leave / congé            → navigate to Leave/Congés section href\n"
         "  employees / employés     → navigate to PIM/Employees section href\n\n"
+        "SAUCEDEMO-SPECIFIC SELECTORS (use EXACTLY when testing saucedemo.com):\n"
+        "  Username field          → fill field='user-name'\n"
+        "  Password field          → fill field='password'\n"
+        "  Login button            → submit (or click 'Login')\n"
+        "  Sort dropdown           → {\"action\":\"select\",\"field\":\"product_sort_container\",\"value\":\"<option text>\"}\n"
+        "    Options: 'Name (A to Z)', 'Name (Z to A)', 'Price (low to high)', 'Price (high to low)'\n"
+        "  Hamburger menu (open)   → click value='Open Menu'\n"
+        "  Hamburger menu (close)  → click value='Close Menu'\n"
+        "  Cart icon               → navigate value='/cart.html'\n"
+        "  Add to cart (any item)  → click value='Add to cart'\n"
+        "  Remove from cart        → click value='Remove'\n"
+        "  Checkout button         → click value='Checkout'\n"
+        "  Continue button         → click value='Continue'\n"
+        "  Finish button           → click value='Finish'\n"
+        "  Logout link             → click value='Logout'\n"
+        "  All Items link          → click value='All Items'\n"
+        "  About link              → click value='About'\n"
+        "  Reset App State         → click value='Reset App State'\n\n"
         "Step action types (use ONLY these):\n"
-        '  {"action":"navigate","value":"EXACT_HREF"}   ← use hrefs from App sections list\n'
+        '  {"action":"navigate","value":"EXACT_HREF"}   ← use hrefs from App sections list OR absolute URL\n'
         '  {"action":"fill","field":"fieldName","value":"testValue"}\n'
+        '  {"action":"select","field":"dropdownName","value":"optionLabel"}  ← for <select> dropdowns\n'
         '  {"action":"click","value":"label as shown in the app UI"}\n'
         '  {"action":"click_row_action","row":"identifying text in the row","value":"delete|edit"}  ← icon button in table row\n'
         '  {"action":"submit"}\n'
@@ -586,21 +625,30 @@ def convert_spec_scenarios_to_steps(
         '  {"action":"wait","value":"2"}\n\n'
         "STRICT RULES:\n"
         "1. ONE test case per scenario — do NOT skip any\n"
-        "2. LOGIN: navigate → fill username → fill password → submit → verify_text\n"
+        "2. LOGIN: fill username → fill password → submit → verify_text\n"
         "   submit is MANDATORY before verify_text in any form scenario\n"
-        "3. LOGOUT: click value matching 'Logout'/'Se déconnecter' (try user avatar/profile menu first)\n"
+        "3. LOGOUT on SauceDemo: click 'Open Menu' → click 'Logout' → verify_text 'Login'\n"
         "4. NAVIGATION: navigate with EXACT href from App sections, then verify_text with a page title visible on that page\n"
         "5. verify_text: a short keyword (MAX 20 chars) that ACTUALLY appears on the page.\n"
         "   NEVER use full sentences or long error messages — use the KEY WORD only.\n"
         "   Examples: 'Products', 'Dashboard', 'Successfully', 'Login', 'required', 'Invalid', 'THANK YOU'.\n"
-        "   For OrangeHRM CRUD success: 'Successfully'. For login success: 'Dashboard'.\n"
-        "   For logout: 'Login'. For search results: 'Records Found'.\n"
-        "   For form validation errors: use only the key word, e.g. 'required' or 'Error'.\n"
+        "   SauceDemo specifics:\n"
+        "     Login success → verify_text 'Products'\n"
+        "     Invalid login → verify_text 'Epic sadface'\n"
+        "     Locked user   → verify_text 'locked out'\n"
+        "     Logout        → verify_text 'Login'\n"
+        "     Cart page     → verify_text 'Your Cart'\n"
+        "     Checkout info → verify_text 'Checkout'\n"
+        "     Order overview → verify_text 'Overview'\n"
+        "     Order complete → verify_text 'THANK YOU'\n"
+        "     Item added    → verify_text 'Remove'\n"
+        "     Sort changed  → verify_text 'Products'\n"
         "   FORBIDDEN in verify_text: full sentences, any invented person name (John Doe, Jane Smith),\n"
         "   'Employee Created', 'Employee Deleted', 'Employee Updated', 'Leave Applied', 'Leave Approved',\n"
         "   'Record Saved', 'Action Completed', 'Leave Balance', 'Leave History'.\n"
-        "6. Use test_data values (Username/Password) from the scenario's 'Test data' field\n"
-        "7. For navigate: ALWAYS use exact href from App sections — never invent URLs\n"
+        "6. Use test_data values (Username/Password) from the scenario's '→ Username / Password' lines\n"
+        "   ALWAYS use the EXACT credentials from test_data — never invent or reuse credentials from other scenarios\n"
+        "7. For navigate: use exact href from App sections OR absolute URL from the spec\n"
         "8. description ≤ 70 chars, expected ≤ 70 chars\n"
         "9. TABLE DELETE/EDIT: When the spec asks to delete or edit a row in a table, use click_row_action.\n"
         "   The 'row' field must contain unique text visible in that row (e.g. the username).\n"
@@ -633,7 +681,33 @@ def convert_spec_scenarios_to_steps(
         "    - NEVER use a cart badge count ('1', '2') as verify_text.\n"
         "15. RESET APP STATE (SauceDemo menu): After clicking Reset App State in the hamburger menu,\n"
         "    the cart is cleared but the page stays on inventory. verify_text 'Products'\n"
-        "    (the inventory page heading is always 'Products' and always visible after reset).\n\n"
+        "    (the inventory page heading is always 'Products' and always visible after reset).\n"
+        "16. SELF-CONTAINED TESTS — CRITICAL RULE:\n"
+        "    Each test case runs in isolation — there is NO guaranteed session state between tests.\n"
+        "    If the scenario REQUIRES being logged in (Préconditions say 'Utilisateur connecté',\n"
+        "    or the test does something that needs auth: browse products, add to cart, checkout,\n"
+        "    open menu, logout), you MUST prepend login steps at the very beginning:\n"
+        "      {\"action\":\"fill\",\"field\":\"user-name\",\"value\":\"standard_user\"}\n"
+        "      {\"action\":\"fill\",\"field\":\"password\",\"value\":\"secret_sauce\"}\n"
+        "      {\"action\":\"submit\"}\n"
+        "    Exception: login tests (TC-001, TC-002, TC-003, TC-017) and access-control tests\n"
+        "    (TC-013) must NOT prepend login — they test the login page state themselves.\n"
+        "    For TC-013 (access without auth): navigate directly to the protected URL,\n"
+        "    then verify_text 'Login' (redirected to login page).\n"
+        "17. PRODUCT-SPECIFIC ADD TO CART:\n"
+        "    To add a specific product (e.g. 'Sauce Labs Backpack'), click 'Add to cart' button —\n"
+        "    SauceDemo shows 6 products; 'Add to cart' clicks the FIRST available button.\n"
+        "    To add the Bike Light specifically: first click the product name 'Sauce Labs Bike Light'\n"
+        "    (navigates to detail page), then click 'Add to cart' on the detail page.\n"
+        "18. PERFORMANCE TEST (TC-017): Login with credentials 'performance_glitch_user' / 'secret_sauce',\n"
+        "    then add a wait step of 5 seconds: {\"action\":\"wait\",\"value\":\"5\"},\n"
+        "    then verify_text 'Products'. This simulates the slow login delay.\n"
+        "19. TESTS THAT NEED A PRODUCT IN CART AS PRECONDITION (TC-010, TC-011, TC-012, TC-016, TC-018):\n"
+        "    After the login steps (rule 16), add these setup steps BEFORE the actual test steps:\n"
+        "      {\"action\":\"click\",\"value\":\"Add to cart\"}\n"
+        "    This adds the first product so the cart is not empty when the test begins.\n"
+        "    For TC-016 (Reset App State): add product, THEN open menu and click Reset App State.\n"
+        "    For TC-018 (badge with 2 items): add 'Add to cart' twice in a row (two different buttons).\n\n"
         "Return ONLY valid JSON:\n"
         '{"test_cases":[{"id":"TC001","description":"...","steps":[...],"expected":"..."}]}'
     )
@@ -677,6 +751,10 @@ def convert_spec_scenarios_to_steps(
         if batch_idx < len(batches) - 1:
             logger.info("Waiting 65s between batches (Groq TPM quota)…")
             time.sleep(65)
+
+    # Repair pass — fuzzy=False: `fields` only reflects the entry page, so
+    # fields referenced on post-login pages must not be rewritten by guesswork.
+    all_results = _validate_test_cases(all_results, fields, fuzzy=False)
 
     logger.info("Converted %d spec scenarios total.", len(all_results))
     return all_results
@@ -745,6 +823,7 @@ def _build_interface_context(fields: list, url: str,
         if f.get("label"):       parts.append(f"label='{f['label']}'")
         if f.get("placeholder"): parts.append(f"placeholder='{f['placeholder']}'")
         if f.get("type"):        parts.append(f"type={f['type']}")
+        if f.get("required"):    parts.append("REQUIRED")
         field_details.append(f"{name} ({', '.join(parts)})" if parts else name)
 
     lines = [f"URL: {url}"]
@@ -782,10 +861,22 @@ def _build_interface_context(fields: list, url: str,
         lines.append(f"All clickable: {' | '.join(unique)}")
     if ctx.get("icons"):
         lines.append(f"Icon buttons (no text): {' | '.join(ctx['icons'][:12])}")
+    if ctx.get("nav_links"):
+        nav = " | ".join(
+            f"{l.get('text', '')}={l.get('href', '')}"
+            for l in ctx["nav_links"][:10] if l.get("href")
+        )
+        lines.append(f"Navigation links (text=href — use the EXACT href in navigate steps): {nav}")
+    if ctx.get("alerts"):
+        lines.append(
+            f"Messages currently visible on page (real assertion text): {' | '.join(ctx['alerts'][:5])}"
+        )
     if ctx.get("selects"):
         for sel in ctx["selects"][:4]:
-            opts = ", ".join(sel.get("options", [])[:6])
-            lines.append(f"Dropdown '{sel.get('name','')}': [{opts}]")
+            opts = ", ".join(sel.get("options", [])[:8])
+            # Pick the best identifier for the `select` action field parameter
+            field_id = sel.get("id") or sel.get("name") or sel.get("class", "").split()[0] if sel.get("class") else sel.get("name", "")
+            lines.append(f"Dropdown field='{field_id}' options=[{opts}]  (use this exact field id in select action)")
     if ctx.get("has_table"):
         row_info = f"{ctx.get('row_count', 0)} rows"
         header_info = ""
@@ -798,6 +889,142 @@ def _build_interface_context(fields: list, url: str,
         lines.append(f"Page text excerpt: {page_text[:250]}")
 
     return "\n".join(lines)
+
+
+# deterministic post-validation of LLM-generated test cases
+
+def _resolve_field_id(name: str, fields: list, fuzzy: bool = True) -> str | None:
+    """Map an LLM-written field name to a real observed field identifier.
+
+    Exact id/name match first (case-insensitive), then — if fuzzy — substring
+    and label/placeholder matching. Returns None when nothing matches.
+    """
+    if not name or not fields:
+        return None
+    target = name.strip().lower()
+
+    # 1. exact id/name match (the identifier fill_field resolves fastest)
+    for f in fields:
+        for key in ("id", "name"):
+            v = (f.get(key) or "").strip()
+            if v and v.lower() == target:
+                return v
+
+    if not fuzzy:
+        return None
+
+    # 2. relaxed: target appears in id/name/label/placeholder (or vice-versa)
+    tokens = [t for t in re.split(r"[\s_\-]+", target) if len(t) >= 3]
+    for f in fields:
+        ident = f.get("id") or f.get("name") or ""
+        if not ident:
+            continue
+        hay = " ".join(
+            str(f.get(k) or "") for k in ("id", "name", "label", "placeholder")
+        ).lower()
+        if target in hay or (tokens and any(tok in hay for tok in tokens)):
+            return ident
+    return None
+
+
+def _snap_select_value(field: str, value: str, selects: list) -> str:
+    """Snap an LLM-written dropdown value to the closest real option label."""
+    if not value or not selects:
+        return value
+    field_l = (field or "").lower()
+    value_l = value.lower()
+    for sel in selects:
+        idents = {str(sel.get(k) or "").lower() for k in ("id", "name", "data_test")}
+        if field_l and field_l not in idents and not any(field_l in i for i in idents if i):
+            continue
+        options = sel.get("options") or []
+        for opt in options:            # exact (case-insensitive)
+            if opt.lower() == value_l:
+                return opt
+        for opt in options:            # substring either way
+            if value_l in opt.lower() or opt.lower() in value_l:
+                return opt
+    return value
+
+
+def _validate_test_cases(cases: list, fields: list,
+                         ctx: dict | None = None, fuzzy: bool = True) -> list:
+    """Deterministically repair LLM-generated test cases against the real page.
+
+    - fill/select/clear/check: resolve 'field' to an observed field identifier
+    - select: snap the value to a real option label
+    - verify_text: strip quotes, drop bare-number assertions, truncate to 30 chars
+    - insert a missing {"action":"submit"} between a fill and its verify_text
+    - drop cases with no usable steps
+    """
+    ctx      = ctx or {}
+    selects  = ctx.get("selects") or []
+    valid: list = []
+
+    for tc in cases:
+        if not isinstance(tc, dict):
+            continue
+        steps = tc.get("steps")
+        if not isinstance(steps, list) or not steps:
+            continue
+
+        fixed_steps: list = []
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            action = step.get("action") or ("fill" if step.get("field") else "")
+
+            if action in ("fill", "clear", "check", "select") and step.get("field"):
+                resolved = _resolve_field_id(str(step["field"]), fields, fuzzy=fuzzy)
+                if resolved and resolved != step["field"]:
+                    logger.debug("Field repair: %r → %r in %s",
+                                 step["field"], resolved, tc.get("id", "?"))
+                    step["field"] = resolved
+
+            if action == "select":
+                step["value"] = _snap_select_value(
+                    str(step.get("field") or ""), str(step.get("value") or ""), selects
+                )
+
+            if action == "verify_text":
+                val = str(step.get("value") or step.get("text") or "").strip().strip("'\"")
+                # bare numbers / single chars are useless assertions — drop the step
+                if not val or val.isdigit() or len(val) < 2:
+                    logger.debug("Dropping useless verify_text %r in %s", val, tc.get("id", "?"))
+                    continue
+                if len(val) > 30:
+                    val = (val[:30].rsplit(" ", 1)[0] or val[:30]).strip()
+                step["value"] = val
+
+            if action == "fill" and len(str(step.get("value") or "")) > 60:
+                step["value"] = str(step["value"])[:60]
+
+            fixed_steps.append(step)
+
+        # form filled but never submitted before the assertion → insert submit
+        first_verify = next(
+            (i for i, s in enumerate(fixed_steps) if s.get("action") == "verify_text"), None
+        )
+        if first_verify is not None:
+            before      = fixed_steps[:first_verify]
+            has_fill    = any(s.get("action") in ("fill", "fill_form", "select", "check") for s in before)
+            has_trigger = any(s.get("action") in ("submit", "click", "click_row_action") for s in before)
+            if has_fill and not has_trigger:
+                logger.debug("Inserting missing submit before verify_text in %s", tc.get("id", "?"))
+                fixed_steps.insert(first_verify, {"action": "submit"})
+
+        if not fixed_steps:
+            continue
+        for k in ("description", "expected"):
+            if isinstance(tc.get(k), str):
+                tc[k] = tc[k].strip()
+        tc["steps"] = fixed_steps
+        valid.append(tc)
+
+    dropped = len(cases) - len(valid)
+    if dropped:
+        logger.info("Validation dropped %d unusable test case(s).", dropped)
+    return valid
 
 
 _ACTIONS_DOC = (
@@ -856,6 +1083,27 @@ _JSON_FMT = (
     'OUTPUT: JSON ONLY — no preamble, no explanation, no text before or after.\n'
     'Start your response with { and end with }.\n'
     '{"test_cases":[{"id":"TC001","description":"...","steps":[{"action":"fill","field":"f","value":"v"},{"action":"submit"}],"expected":"..."}]}'
+)
+
+_EXAMPLE_CASE = (
+    'EXAMPLE — page with Form fields user-name, password and Heading "Products" after login:\n'
+    '{"test_cases":[{"id":"TC001","description":"Connexion valide",'
+    '"steps":[{"action":"fill","field":"user-name","value":"standard_user"},'
+    '{"action":"fill","field":"password","value":"secret_sauce"},'
+    '{"action":"submit"},'
+    '{"action":"verify_text","value":"Products"}],'
+    '"expected":"Utilisateur connecté, page Products affichée"}]}\n'
+)
+
+_SELF_CHECK = (
+    'FINAL SELF-CHECK — silently fix any violation BEFORE returning:\n'
+    '1. Every fill/select "field" value exists VERBATIM in the "Form fields" or "Dropdown" lines above.\n'
+    '2. Every click text exists VERBATIM in "Buttons/Links", "All clickable" or "Icon buttons".\n'
+    '3. Every navigate value is an EXACT href from "Navigation links".\n'
+    '4. Any scenario that fills a form has {"action":"submit"} BEFORE its verify_text.\n'
+    '5. verify_text is ≤ 20 chars of text that will REALLY be on screen — prefer words from\n'
+    '   "Headings", "Messages currently visible", or generic \'Successfully\'/\'Invalid\'/\'required\'.\n'
+    '6. Negative tests (invalid input) expect an ERROR keyword, never a success keyword.\n'
 )
 
 
@@ -950,7 +1198,8 @@ def _identify_scenarios(interface_ctx: str) -> list[str]:
             "ALSO check:\n"
             "  - 'All clickable' / 'Buttons/Links': Add/Edit/Delete/Search buttons → one scenario each\n"
             "  - 'Icon buttons': Cart, Toggle Menu, Search, User Profile, etc. → one scenario EACH (open it, verify it works)\n"
-            "  - 'Form fields': empty required, invalid format, boundary length\n"
+            "  - 'Form fields': empty required, invalid format, boundary length — fields marked REQUIRED get a dedicated empty-field test\n"
+            "  - 'Navigation links': the 2-3 most important sections → one navigation scenario each\n"
             "  - 'Data table present': verify it loads\n\n"
             "Return ONLY a raw JSON array of short French descriptions (max 40 chars each).\n"
             "No preamble — start directly with [\n"
@@ -1001,24 +1250,39 @@ def _generate_batch(scenarios: list[str], interface_ctx: str,
     model = get_llm(max_tokens=2500)
     scenario_list = "\n".join(f"{i+1}. {s}" for i, s in enumerate(scenarios))
     _VERIFY_RULE = (
-        "verify_text RULE — value must be a SHORT keyword (max 15 chars) that WILL appear:\n"
-        "  Success cases: 'Successfully', 'saved', 'added', 'deleted', 'updated'\n"
-        "  Error cases:   'Invalid', 'required', 'incorrect', 'error'\n"
-        "  Login success: 'Dashboard' or 'Welcome'\n"
-        "  NEVER use full sentences, NEVER invent messages you are not sure about.\n"
-        "  If unsure what text appears, use 'Successfully' for success or 'Invalid' for error.\n"
+        "verify_text RULE — value must be a SHORT keyword (max 20 chars) that WILL appear on-screen:\n"
+        "  Success cases:  'Successfully', 'saved', 'added', 'deleted', 'updated', 'Welcome'\n"
+        "  Error/invalid:  'Invalid', 'required', 'incorrect', 'error', 'failed'\n"
+        "  Page headings:  use the EXACT word from 'Headings' section (e.g. 'Products', 'Dashboard')\n"
+        "  Login success:  use heading from 'Headings' if present, else 'Dashboard' or 'Welcome'\n"
+        "  Cart/checkout:  'Your Cart', 'Overview', 'THANK YOU'\n"
+        "  NEVER use full sentences — short keyword only.\n"
+        "  NEVER invent text you are not sure about; prefer 'Successfully' for success, 'Invalid' for error.\n"
+    )
+    _FIELD_RULE = (
+        "FIELD ID RULE:\n"
+        "  - fill: ONLY use identifiers listed in 'Form fields' section (exact id or name)\n"
+        "  - select: ONLY use identifiers listed in 'Dropdown' lines — value MUST be one of the listed options\n"
+        "  - Do NOT invent field IDs that are not in the context above.\n"
+        "  - If 'Form fields' lists 'user-name', write: {\"action\":\"fill\",\"field\":\"user-name\",\"value\":\"...\"}\n"
     )
     sys_msg = (
         "You are a senior QA Engineer. Generate test cases for these specific scenarios.\n\n"
         + _ACTIONS_DOC + "\n"
         + _OUTPUT_RULES + "\n"
         + _VERIFY_RULE + "\n"
+        + _FIELD_RULE + "\n"
+        + _SELF_CHECK + "\n"
+        + _EXAMPLE_CASE + "\n"
         + _JSON_FMT
     )
     user_msg = (
         f"{interface_ctx}\n\n"
         f"Generate test cases for EXACTLY these scenarios:\n{scenario_list}\n"
-        f"Start IDs at TC{start_id:03d}."
+        f"Start IDs at TC{start_id:03d}.\n"
+        f"IMPORTANT: use ONLY field IDs from the 'Form fields' section above. "
+        f"Use ONLY dropdown values from the 'Dropdown' lines. "
+        f"Use ONLY button text from 'Buttons/Links' or 'All clickable' sections."
     )
     try:
         msgs = [SystemMessage(content=sys_msg), HumanMessage(content=user_msg)]
@@ -1067,6 +1331,12 @@ def generate_quick_test_cases(fields: list, url: str,
         all_cases.extend(cases)
         if i + batch_size < len(scenarios):
             time.sleep(5)  # pause between batches to stay within 6k TPM
+
+    # Deterministic repair pass: fix field IDs, dropdown values, verify_text,
+    # and missing submits against what actually exists on the page.
+    all_cases = _validate_test_cases(all_cases, fields, page_context, fuzzy=True)
+    for i, tc in enumerate(all_cases, 1):
+        tc["id"] = f"TC{i:03d}"
 
     logger.info("Generated %d test cases for %s", len(all_cases), url)
     return all_cases

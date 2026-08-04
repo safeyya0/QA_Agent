@@ -12,6 +12,7 @@ import builtins
 from datetime import datetime
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from pydantic import BaseModel
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, StreamingResponse
 
@@ -185,6 +186,26 @@ def _normalize_url(url: str) -> str:
         url = "https://" + url
     return url
 
+
+class RunTestRequest(BaseModel):
+    url: str
+    test_description: str
+    browsers: str = "chromium"
+
+
+@app.post("/api/run-test")
+async def run_test(body: RunTestRequest):
+    if not body.url or not body.test_description:
+        raise HTTPException(status_code=400, detail="url and test_description are required.")
+    browser_list = [b.strip() for b in body.browsers.split(",") if b.strip()] or ["chromium"]
+    agent = CoreAgent()
+    try:
+        result = await agent.run_multi_browser_with_spec(
+            _normalize_url(body.url), body.test_description, browser_list, emit_fn=_broadcast_event
+        )
+        return result
+    finally:
+        _broadcast_done()
 
 
 @app.post("/api/run-agent-with-spec")

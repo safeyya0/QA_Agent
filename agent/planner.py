@@ -3,7 +3,7 @@ import re
 import logging
 from typing import Any
 from tools.llm import generate_quick_test_cases, generate_tests_from_spec, convert_spec_scenarios_to_steps
-from tools.auth import detect_auth_forms
+from tools.auth import detect_auth_forms, is_valid_login_expectation
 
 logger = logging.getLogger(__name__)
 
@@ -122,14 +122,48 @@ class Planner:
         if icon_labels:
             ctx["icons"] = icon_labels[:12]
 
+        # Real nav links with hrefs — lets the LLM write navigate steps that work
+        nav_links = [
+            {"text": e["text"], "href": e["href"]}
+            for e in elements
+            if e.get("category") == "navigation" and e.get("href", "").strip()
+        ]
+        if nav_links:
+            ctx["nav_links"] = nav_links[:10]
+
         # Page metadata from observer
         if pi.get("title"):
             ctx["title"] = pi["title"]
-        if pi.get("headings"):
-            ctx["headings"] = pi["headings"][:6]
-        if labels:
-            ctx["labels"] = labels[:12]
-        if selects:
+
+        # headings from observer is a dict {"h1": [...], "h2": [...], "h3": [...], "labels": [...], "alerts": [...]}
+        heading_data = pi.get("headings")
+        extra_labels: list[str] = []
+        if heading_data:
+            if isinstance(heading_data, dict):
+                heading_list = (
+                    heading_data.get("h1", [])
+                    + heading_data.get("h2", [])
+                    + heading_data.get("h3", [])
+                )
+                if heading_list:
+                    ctx["headings"] = heading_list[:6]
+                extra_labels = heading_data.get("labels", [])
+                # Alert/toast texts currently visible — real assertion candidates
+                if heading_data.get("alerts"):
+                    ctx["alerts"] = heading_data["alerts"][:5]
+            else:
+                ctx["headings"] = list(heading_data)[:6]
+
+        # Merge form-field labels with labels extracted by the headings observer
+        all_labels = list(dict.fromkeys(labels + extra_labels))
+        if all_labels:
+            ctx["labels"] = all_labels[:15]
+
+        # selects: prefer observer's richer extraction (class/data-test support) over form-field selects
+        observer_selects = pi.get("selects")
+        if observer_selects:
+            ctx["selects"] = observer_selects[:4]
+        elif selects:
             ctx["selects"] = selects[:4]
 
         # Table metadata
@@ -420,6 +454,10 @@ class Planner:
         return test_cases
 
 
+
+    def _is_valid_login_test(self, test_case: dict[str, Any]) -> bool:
+        """True when the test case expects a SUCCESSFUL login outcome."""
+        return is_valid_login_expectation(test_case.get("expected", ""))
 
     def _auth_scenario(self, auth_info: dict[str, Any]) -> dict[str, Any]:
         """Return the canonical auth-flow meta test-case."""

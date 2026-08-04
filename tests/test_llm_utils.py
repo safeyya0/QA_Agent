@@ -89,3 +89,111 @@ class TestRepairTruncatedArray:
         text = '[{"id": "TC001", "description": "User\\"s login", "steps": [], "expected": "ok"}'
         result = _repair_truncated_array(text)
         assert result is not None
+
+
+# ── _validate_test_cases / _resolve_field_id / _snap_select_value ──────────────
+
+from tools.llm import _validate_test_cases, _resolve_field_id, _snap_select_value
+
+FIELDS = [
+    {"id": "user-name", "name": "user-name", "label": "Username", "placeholder": "Username", "type": "text"},
+    {"id": "password", "name": "password", "label": "Password", "type": "password"},
+]
+
+
+class TestResolveFieldId:
+
+    def test_exact_match_returned_as_is(self):
+        assert _resolve_field_id("user-name", FIELDS) == "user-name"
+
+    def test_case_insensitive_exact_match(self):
+        assert _resolve_field_id("Password", FIELDS) == "password"
+
+    def test_fuzzy_matches_label(self):
+        assert _resolve_field_id("username", FIELDS) == "user-name"
+
+    def test_fuzzy_disabled_returns_none_for_label(self):
+        assert _resolve_field_id("username", FIELDS, fuzzy=False) is None
+
+    def test_unknown_field_returns_none(self):
+        assert _resolve_field_id("zipcode", FIELDS, fuzzy=False) is None
+
+    def test_empty_inputs(self):
+        assert _resolve_field_id("", FIELDS) is None
+        assert _resolve_field_id("x", []) is None
+
+
+class TestSnapSelectValue:
+
+    SELECTS = [{"id": "sort", "name": "sort", "options": ["Name (A to Z)", "Price (low to high)"]}]
+
+    def test_exact_option_kept(self):
+        assert _snap_select_value("sort", "Name (A to Z)", self.SELECTS) == "Name (A to Z)"
+
+    def test_substring_snapped_to_full_label(self):
+        assert _snap_select_value("sort", "price (low", self.SELECTS) == "Price (low to high)"
+
+    def test_unknown_value_left_alone(self):
+        assert _snap_select_value("sort", "Rating", self.SELECTS) == "Rating"
+
+
+class TestValidateTestCases:
+
+    def test_repairs_wrong_field_id(self):
+        cases = [{"id": "TC001", "description": "d", "expected": "e", "steps": [
+            {"action": "fill", "field": "username", "value": "u"},
+        ]}]
+        out = _validate_test_cases(cases, FIELDS)
+        assert out[0]["steps"][0]["field"] == "user-name"
+
+    def test_inserts_submit_before_verify_text(self):
+        cases = [{"id": "TC001", "description": "d", "expected": "e", "steps": [
+            {"action": "fill", "field": "user-name", "value": "u"},
+            {"action": "verify_text", "value": "Products"},
+        ]}]
+        out = _validate_test_cases(cases, FIELDS)
+        actions = [s["action"] for s in out[0]["steps"]]
+        assert actions == ["fill", "submit", "verify_text"]
+
+    def test_no_submit_inserted_when_click_present(self):
+        cases = [{"id": "TC001", "description": "d", "expected": "e", "steps": [
+            {"action": "fill", "field": "user-name", "value": "u"},
+            {"action": "click", "text": "Save"},
+            {"action": "verify_text", "value": "Successfully"},
+        ]}]
+        out = _validate_test_cases(cases, FIELDS)
+        actions = [s["action"] for s in out[0]["steps"]]
+        assert "submit" not in actions
+
+    def test_drops_bare_number_verify_text(self):
+        cases = [{"id": "TC001", "description": "d", "expected": "e", "steps": [
+            {"action": "click", "text": "Add to cart"},
+            {"action": "verify_text", "value": "1"},
+        ]}]
+        out = _validate_test_cases(cases, FIELDS)
+        actions = [s["action"] for s in out[0]["steps"]]
+        assert "verify_text" not in actions
+
+    def test_truncates_long_verify_text_at_word_boundary(self):
+        long_text = "The employee record was created successfully in the system"
+        cases = [{"id": "TC001", "description": "d", "expected": "e", "steps": [
+            {"action": "click", "text": "Save"},
+            {"action": "verify_text", "value": long_text},
+        ]}]
+        out = _validate_test_cases(cases, FIELDS)
+        vt = out[0]["steps"][1]["value"]
+        assert len(vt) <= 30
+        assert not vt.endswith(" ")
+
+    def test_drops_case_without_steps(self):
+        cases = [
+            {"id": "TC001", "description": "d", "expected": "e", "steps": []},
+            {"id": "TC002", "description": "d", "expected": "e", "steps": [{"action": "submit"}]},
+        ]
+        out = _validate_test_cases(cases, FIELDS)
+        assert len(out) == 1
+        assert out[0]["id"] == "TC002"
+
+    def test_non_dict_entries_ignored(self):
+        out = _validate_test_cases(["garbage", None], FIELDS)
+        assert out == []

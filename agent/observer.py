@@ -23,20 +23,24 @@ class Observer:
         elements: list[dict[str, Any]] = []
         elements.extend(await self._extract_form_fields())
         elements.extend(await self._extract_buttons())
-        elements.extend(await self._extract_icon_elements())   # icon-only buttons
+        elements.extend(await self._extract_icon_elements())
         elements.extend(await self._extract_tables())
         elements.extend(await self._extract_nav_links())
 
         page_info = await self._extract_page_info()
+        page_info["selects"]  = await self._extract_selects()
+        page_info["headings"] = await self._extract_headings_and_labels()
+
         icons = sum(1 for e in elements if e.get("category") == "action" and e.get("is_icon"))
         logger.info(
-            "Observed %d elements (%d fields, %d actions [%d icons], %d tables, %d nav) at %s",
+            "Observed %d elements (%d fields, %d actions [%d icons], %d tables, %d nav, %d selects) at %s",
             len(elements),
             sum(1 for e in elements if e.get("category") == "form_field"),
             sum(1 for e in elements if e.get("category") == "action"),
             icons,
             sum(1 for e in elements if e.get("category") == "data_display"),
             sum(1 for e in elements if e.get("category") == "navigation"),
+            len(page_info["selects"]),
             url,
         )
         return elements, page_info
@@ -55,6 +59,8 @@ class Observer:
         elements.extend(await self._extract_tables())
         elements.extend(await self._extract_nav_links())
         page_info = await self._extract_page_info()
+        page_info["selects"]  = await self._extract_selects()
+        page_info["headings"] = await self._extract_headings_and_labels()
         logger.info("observe_current: %d elements at %s", len(elements), page_info.get("current_url", "?"))
         return elements, page_info
 
@@ -496,8 +502,112 @@ class Observer:
         return results[:30]
 
 
+    async def _extract_selects(self) -> list[dict[str, Any]]:
+        """Extract all visible <select> elements with their options.
+
+        Returns list of {name, id, options: [label, ...]} dicts.
+        Gives the LLM the exact option labels it needs to write select steps.
+        """
+        page = self.browser.page
+        results: list[dict[str, Any]] = []
+        try:
+            selects = await page.query_selector_all("select")
+            for sel in selects:
+                try:
+                    if not await sel.is_visible():
+                        continue
+                    name = await sel.get_attribute("name") or ""
+                    sid  = await sel.get_attribute("id")   or ""
+                    cls  = await sel.get_attribute("class") or ""
+                    data_test = await sel.get_attribute("data-test") or ""
+                    options: list[str] = await sel.evaluate(
+                        "el => [...el.options].map(o => o.text.trim()).filter(t => t)"
+                    )
+                    if not options:
+                        continue
+                    results.append({
+                        "name":      name or sid or cls.split()[0] if cls else "select",
+                        "id":        sid,
+                        "class":     cls,
+                        "data_test": data_test,
+                        "options":   options[:12],
+                    })
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return results
+
+    async def _extract_headings_and_labels(self) -> dict[str, Any]:
+        """Extract h1/h2/h3, visible form labels, and alert/error messages.
+
+        This gives the LLM the page's semantic structure so it can write
+        better verify_text values and understand page state.
+        """
+        page = self.browser.page
+        result: dict[str, Any] = {"h1": [], "h2": [], "h3": [], "labels": [], "alerts": []}
+        try:
+            for level in ("h1", "h2", "h3"):
+                els = await page.query_selector_all(level)
+                texts = []
+                for el in els:
+                    try:
+                        if await el.is_visible():
+                            t = (await el.inner_text()).strip()[:80]
+                            if t:
+                                texts.append(t)
+                    except Exception:
+                        pass
+                result[level] = texts[:5]
+        except Exception:
+            pass
+
+        try:
+            label_els = await page.query_selector_all("label")
+            labels = []
+            for el in label_els:
+                try:
+                    if await el.is_visible():
+                        t = (await el.inner_text()).strip()[:50]
+                        if t and t not in labels:
+                            labels.append(t)
+                except Exception:
+                    pass
+            result["labels"] = labels[:20]
+        except Exception:
+            pass
+
+        try:
+            alert_data: list[str] = await page.evaluate("""
+                () => {
+                    const sels = [
+                        '[role="alert"]', '[class*="error"]', '[class*="alert"]',
+                        '[class*="warning"]', '[class*="success"]', '[class*="toast"]',
+                        '[class*="notification"]', '[class*="flash"]',
+                    ];
+                    const seen = new Set();
+                    const out = [];
+                    for (const s of sels) {
+                        for (const el of document.querySelectorAll(s)) {
+                            const t = (el.innerText || '').trim().slice(0, 120);
+                            if (t && !seen.has(t) && el.offsetParent !== null) {
+                                seen.add(t);
+                                out.push(t);
+                                if (out.length >= 5) return out;
+                            }
+                        }
+                    }
+                    return out;
+                }
+            """)
+            result["alerts"] = alert_data
+        except Exception:
+            pass
+
+        return result
+
     async def _extract_page_info(self) -> dict[str, Any]:
-        """Return title, current URL, and first 500 chars of body text."""
+        """Return title, current URL, page text, and structured page metadata."""
         page = self.browser.page
         try:
             title = await page.title()

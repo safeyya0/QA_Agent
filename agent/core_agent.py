@@ -514,10 +514,7 @@ class CoreAgent:
         emit_fn,
     ) -> dict:
         """Visit every discovered section, generate and run tests. Returns results matrix."""
-        from tools.llm import generate_quick_test_cases
-
         matrix: dict = {}
-        base_domain = urlparse(url).netloc.removeprefix("www.")
 
         print(f"[PHASE 3] Deep testing — {len(sections)} sections × {len(browsers)} browser(s)")
         if emit_fn:
@@ -660,8 +657,6 @@ class CoreAgent:
         emit_fn,
     ) -> dict:
         """BFS crawl for unauthenticated or pre-login pages."""
-        from tools.llm import generate_quick_test_cases
-
         base_domain = urlparse(start_url).netloc.removeprefix("www.")
         visited:    set[str]  = set()
         queue:      list[str] = [start_url]
@@ -714,9 +709,10 @@ class CoreAgent:
                             queue.append(link)
 
                     # Use observer to get ALL elements
-                    observer    = Observer(bw)
-                    elements, _ = await observer.observe(current)
+                    observer                 = Observer(bw)
+                    elements, page_info      = await observer.observe(current)
                     page_entry["elements"]   = elements
+                    page_entry["page_info"]  = page_info
                     page_entry["page_text"]  = (await bw.get_page_text())
                     page_entry["has_error"]  = await bw.has_error_message()
                     page_entry["screenshot"] = await bw.take_screenshot(
@@ -762,25 +758,7 @@ class CoreAgent:
             }
             url_tc_pairs.append((page["url"], load_tc))
 
-            # Auth type injection
-            fields    = [e for e in page["elements"] if e.get("category") == "form_field"]
-            ctx       = {}
-            auth_info = detect_auth_forms(fields, page["url"], page.get("page_text", ""))
-            if auth_info.get("has_login"):
-                ctx["auth_type"] = "login"
-            elif auth_info.get("has_register"):
-                ctx["auth_type"] = "register"
-
-            # Page context from observer data
-            page_ctx = planner.detect_page_context(page["elements"])
-            if page_ctx != "auth":
-                ctx.update({
-                    "page_type": page_ctx,
-                    "buttons":   [e["text"] for e in page["elements"] if e.get("category") == "action"][:10],
-                    "has_table": any(e.get("category") == "data_display" for e in page["elements"]),
-                    "action_links": [e["text"] for e in page["elements"] if e.get("category") == "action"][:15],
-                })
-
+            fields = [e for e in page["elements"] if e.get("category") == "form_field"]
             has_interactive = (
                 fields
                 or any(e.get("category") == "data_display" for e in page["elements"])
@@ -789,16 +767,16 @@ class CoreAgent:
             if not has_interactive:
                 continue
 
+            page_ctx = planner.detect_page_context(page["elements"])
             print(f"[CRAWL] Generating tests for {page['path']} (context={page_ctx})")
             if emit_fn:
                 emit_fn({"log": f"[CRAWL] Génération tests: {page['path']}"})
 
             try:
                 sub_cases = await asyncio.to_thread(
-                    generate_quick_test_cases,
-                    fields, page["url"],
-                    page["page_text"][:300],
-                    ctx,
+                    planner.plan,
+                    page["elements"], page["url"],
+                    page.get("page_info"),
                 )
                 for j, tc in enumerate(sub_cases, 1):
                     tc["id"]         = f"{page_id}_T{j:02d}"

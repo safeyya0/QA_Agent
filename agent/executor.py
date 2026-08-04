@@ -5,7 +5,12 @@ import logging
 import traceback
 from urllib.parse import urlparse as _urlparse, urljoin as _urljoin
 from tools.browser import BrowserWrapper
-from tools.auth import generate_test_credentials, find_and_click_logout, find_login_link
+from tools.auth import (
+    generate_test_credentials,
+    find_and_click_logout,
+    find_login_link,
+    is_valid_login_expectation,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -61,10 +66,7 @@ class Executor:
         expected = (test_case.get("expected") or "").lower()
 
             # inject env/discovered credentials for valid-login steps
-        is_valid_login = (
-            not re.search(r'\b(fail|error|invalid|incorrect|wrong|reject|empty)\b', expected, re.IGNORECASE)
-            and bool(re.search(r'\b(success|log\s+in|dashboard|valid|welcome)\b', expected, re.IGNORECASE))
-        )
+        is_valid_login = is_valid_login_expectation(expected)
         if is_valid_login and self.verified_credentials:
             creds = self.verified_credentials
             for step in steps:
@@ -205,6 +207,14 @@ class Executor:
                                     break
                         if not found:
                             text_lower = text.lower()
+                            # In-place interactions (cart add, menu toggle, reset, row
+                            # actions…) legitimately change state without navigation or
+                            # toast — only THEY may use the lenient "no error" fallbacks.
+                            _prior_inplace = any(
+                                s.get("action") in
+                                ("click", "click_row_action", "check", "select", "fill_form")
+                                for s in steps[:i]
+                            )
                             # Keywords that signal the step is checking for an error state
                             _error_kws = {
                                 "invalid", "error", "fail", "wrong", "incorrect",
@@ -234,7 +244,7 @@ class Executor:
                                     current_url_ = await self.browser.get_page_url()
                                     current_path = _urlparse(current_url_).path.rstrip("/") or "/"
                                     found = current_path != origin_path
-                                if not found:
+                                if not found and _prior_inplace:
                                     # Final fallback for same-page CRUD operations (delete/add/edit):
                                     # wait briefly so transient validation elements clear, then check
                                     # that no real error is present and the session is still active.
@@ -248,16 +258,19 @@ class Executor:
                                     found = not has_err_now and is_authed
                             else:
                                 # Platform-specific text (e.g. "Dashboard", "Products",
-                                # "Swag Labs") — accept if URL changed OR success message
-                                origin_path = _urlparse(url).path.rstrip("/") or "/"
-                                current_path = _urlparse(
-                                    await self.browser.get_page_url()
-                                ).path.rstrip("/") or "/"
-                                found = (
-                                    current_path != origin_path
-                                    or await self.browser.has_success_message()
-                                )
+                                # "Swag Labs") — first try actual page text, then URL change
+                                page_text_now = (await self.browser.get_page_text()).lower()
+                                found = text_lower in page_text_now
                                 if not found:
+                                    origin_path = _urlparse(url).path.rstrip("/") or "/"
+                                    current_path = _urlparse(
+                                        await self.browser.get_page_url()
+                                    ).path.rstrip("/") or "/"
+                                    found = (
+                                        current_path != origin_path
+                                        or await self.browser.has_success_message()
+                                    )
+                                if not found and _prior_inplace:
                                     # Final fallback: no error detected means the action likely
                                     # succeeded without navigating (cart updates, menu close,
                                     # reset state, new-tab links where current page is unchanged).
@@ -435,8 +448,6 @@ class Executor:
 
         return result
 
-────
-
     async def _re_login(self, login_url: str, credentials: dict) -> None:
         """Re-authenticate when session is lost during platform exploration."""
         logger.info("Session lost — re-logging in to %s", login_url)
@@ -456,8 +467,6 @@ class Executor:
             logger.info("Re-login complete.")
         except Exception as e:
             logger.warning("Re-login failed: %s", e)
-
-────
 
     async def execute_page_load(self, test_case: dict, url: str) -> dict:
         """Navigate to URL and check for errors — no form interaction."""
@@ -487,8 +496,6 @@ class Executor:
             except Exception:
                 pass
         return result
-
-────
 
     async def execute_auth_flow(self, test_case: dict, url: str) -> dict:
         """Run the full authentication flow: register → login → invalid login → logout."""
@@ -587,8 +594,6 @@ class Executor:
 
         logger.info("Auth flow complete — status: %s", result["status"])
         return result
-
-────
 
     async def _step_register(self, auth_info: dict, run_context: dict) -> dict:
         step = {"step": "register", "status": "passed", "note": None, "screenshot": None}
